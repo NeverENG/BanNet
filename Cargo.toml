@@ -1,0 +1,18 @@
+[package]
+name = "bannet"
+version = "0.1.0"
+edition = "2021"
+description = "一个极致轻量的异步 TCP 框架 —— 学习 Rust + 网络编程"
+
+# 这是一个 library crate:BanNet 框架本体。
+# 库根是 src/lib.rs。用户通过 `use bannet::...` 使用它。
+[lib]
+name = "bannet"
+path = "src/lib.rs"
+
+[dependencies]
+# tokio:异步运行时。先用 full 特性,等结构稳定再裁剪成极致轻量。
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+# dev-dependencies 只在编译 examples/tests/benches 时用到,不会进入库的依赖。
