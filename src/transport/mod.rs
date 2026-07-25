@@ -10,6 +10,8 @@ mod connection;
 mod manager;
 
 // ── 本层对外暴露的 API ──
-// TODO(阶段 2 / 4):
-// pub use connection::Connection;
+// 阶段 0:Server 需要用到 Connection,先在 crate 内导出。
+pub(crate) use connection::Connection;
+
+// TODO(阶段 4):
 // pub use manager::ConnManager;

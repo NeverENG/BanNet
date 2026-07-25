@@ -10,3 +10,42 @@
 //!   - add_router(id, router)   注册业务处理器
 //!
 //! TODO(阶段 0 起步)。
+
+use std::net::TcpListener;
+use crate::transport::Connection;
+
+pub struct Server {
+  listener: TcpListener,
+  addr: String,
+  max_conns: usize,
+  workers: usize,
+}
+
+impl Server{
+  pub fn new(addr: String, max_conns: usize, workers: usize) -> Server{
+    Server{
+      listener: TcpListener::bind(&addr).unwrap(),
+      addr,
+      max_conns,
+      workers,
+    }
+  }
+  pub fn start(&self){
+    // todo 这里启动和管理所有的连接，负责链接客户端，并包装成Connection对
+    for stream in self.listener.incoming(){
+        match stream{
+            Ok(stream) => {
+                let peer = stream.peer_addr().unwrap();
+                let conn = Connection::new(stream, peer);
+                conn.start();
+            }
+            Err(e) => {
+                eprintln!("「BanNet」accept error: {}", e);
+            }
+        }
+    }
+  }
+  pub fn stop(&self){
+    // todo 这里停止所有的连接，负责关闭所有的连接，
+  }
+}

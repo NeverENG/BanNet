@@ -37,10 +37,10 @@ mod server;
 mod transport;
 
 // ── crate 根公开 API(重导出)──
-// TODO(阶段推进时逐步打开):把各层的核心类型提到 crate 根,
-// 让用户能直接写 `use bannet::Server;` 而不用关心内部分层。
-//
+// 逐阶段打开。阶段 0:先把 Server 摆上货架,用户 `use bannet::Server;` 即可。
+pub use server::Server;
+
+// TODO(后续阶段逐步打开):
 // pub use protocol::Message;
 // pub use routing::{Request, Router};
-// pub use server::Server;
 // pub use transport::Connection;
