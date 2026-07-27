@@ -11,41 +11,58 @@
 //!
 //! TODO(阶段 0 起步)。
 
-use std::net::TcpListener;
 use crate::transport::Connection;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 pub struct Server {
-  listener: TcpListener,
-  addr: String,
-  max_conns: usize,
-  workers: usize,
+    listener: TcpListener,
+    addr: String,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 }
 
-impl Server{
-  pub fn new(addr: String, max_conns: usize, workers: usize) -> Server{
-    Server{
-      listener: TcpListener::bind(&addr).unwrap(),
-      addr,
-      max_conns,
-      workers,
+impl Server {
+    pub async fn new(addr: String) -> Server {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = TcpListener::bind(&addr).await.unwrap();
+
+        Server {
+            listener,
+            addr,
+            shutdown_tx,
+            shutdown_rx,
+        }
     }
-  }
-  pub fn start(&self){
-    // todo 这里启动和管理所有的连接，负责链接客户端，并包装成Connection对
-    for stream in self.listener.incoming(){
-        match stream{
-            Ok(stream) => {
-                let peer = stream.peer_addr().unwrap();
-                let conn = Connection::new(stream, peer);
-                conn.start();
+
+    pub async fn start(&self) {
+        loop {
+            let (stream, addr) = self.listener.accept().await.unwrap();
+            let conn = Connection::new(stream, addr, self.shutdown_rx.clone());
+            tokio::spawn(async move {
+                conn.start().await;
+            });
+        }
+    }
+
+    pub async fn server(self) {
+        let shutdown_tx = self.shutdown_tx.clone();
+        let addr = self.addr.clone();
+
+        tokio::spawn(async move {
+            self.start().await;
+        });
+
+        eprintln!("BanNet echo server 启动中,监听 {} ...", addr);
+
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                shutdown_tx.send(true).unwrap();
+                eprintln!("「BanNet」收到 Ctrl-C,准备退出...");
             }
             Err(e) => {
-                eprintln!("「BanNet」accept error: {}", e);
+                eprintln!("「BanNet」监听 Ctrl-C 失败: {}", e);
             }
         }
     }
-  }
-  pub fn stop(&self){
-    // todo 这里停止所有的连接，负责关闭所有的连接，
-  }
 }

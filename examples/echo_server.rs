@@ -28,10 +28,10 @@
 // 阶段 0:裸字节 echo server。跑起来后,你发什么它原样回什么。
 use bannet::Server;
 
-
-fn main() {
+#[tokio::main]
+async fn main() {
     // new 现在要 3 个参数:地址、最大连接数、worker 数(后两个暂时没用上)
-    let server = Server::new("127.0.0.1:8999".to_string(), 1024, 4);
+    let server = Server::new("127.0.0.1:8999".to_string()).await;
     println!("BanNet echo server 启动中,监听 127.0.0.1:8999 ...");
-    server.start();
+    server.start().await;
 }
