@@ -31,11 +31,11 @@
 // ── 子系统(层)声明 ──
 // 每个 `mod` 对应 src/ 下的一个目录(protocol/ transport/ routing/),
 // 目录里的 mod.rs 是该层入口。server 是单文件模块。
+mod error;
 mod protocol;
 mod routing;
 mod server;
 mod transport;
-
 // ── crate 根公开 API(重导出)──
 // 逐阶段打开。阶段 0:先把 Server 摆上货架,用户 `use bannet::Server;` 即可。
 pub use server::Server;
@@ -43,4 +43,4 @@ pub use server::Server;
 // TODO(后续阶段逐步打开):
 // pub use protocol::Message;
 // pub use routing::{Request, Router};
-// pub use transport::Connection;
+//pub use transport::Connection;
