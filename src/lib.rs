@@ -31,6 +31,7 @@
 // ── 子系统(层)声明 ──
 // 每个 `mod` 对应 src/ 下的一个目录(protocol/ transport/ routing/),
 // 目录里的 mod.rs 是该层入口。server 是单文件模块。
+mod client;
 mod error;
 mod protocol;
 mod routing;
@@ -40,7 +41,12 @@ mod transport;
 // 逐阶段打开。阶段 0:先把 Server 摆上货架,用户 `use bannet::Server;` 即可。
 pub use server::Server;
 
+// 通用客户端 API。
+pub use client::Client;
+// 目前导出协议类型,方便 examples/客户端直接构造 TLV 消息。
+pub use protocol::DataPack;
+pub use protocol::Message;
+
 // TODO(后续阶段逐步打开):
-// pub use protocol::Message;
 // pub use routing::{Request, Router};
 //pub use transport::Connection;

@@ -6,10 +6,8 @@
 //! - [`message`]  消息本体 `{ id, data }`
 //! - [`datapack`] TLV 封包/拆包
 
-mod message;
 mod datapack;
+mod message;
 
-// ── 本层对外暴露的 API ──
-// TODO(阶段 1):类型写好后打开,把它们提到本层门口。
-// pub use message::Message;
-// pub use datapack::DataPack;
+pub use datapack::DataPack;
+pub use message::Message;

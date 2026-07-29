@@ -6,12 +6,53 @@
 //!   | dataLen  |  msgID   |      data ...     |
 //!   |  u32(LE) |  u32(LE) |   dataLen 字节    |
 //!   +----------+----------+------------------+
-//!
-//! 读的时候:先读固定 8 字节头 -> 得到 dataLen -> 再精确读 dataLen 字节 body。
-//!
-//! 阶段 1 目标:
-//!   - pack(&Message) -> Vec<u8>          封包
-//!   - unpack(head: &[u8]) -> (len, id)   只解头
-//!   - HEAD_LEN 常量 = 8
-//!
-//! TODO(阶段 1):在这里实现 DataPack。
+
+use crate::protocol::message;
+use std::io;
+
+const HEADER_SIZE: usize = 8; // 4 bytes for dataLen + 4 bytes for msgID
+
+/// TLV 封包/拆包工具。
+pub struct DataPack;
+
+impl DataPack {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn pack(&self, message: &message::Message) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(HEADER_SIZE + message.len() as usize);
+        buffer.extend_from_slice(&message.len().to_le_bytes());
+        buffer.extend_from_slice(&message.id().to_le_bytes());
+        buffer.extend_from_slice(message.data());
+        buffer
+    }
+
+    pub fn unpack(&self, data: &[u8]) -> Result<Option<(message::Message, usize)>, io::Error> {
+        if data.len() < HEADER_SIZE {
+            return Ok(None);
+        }
+
+        let data_len = u32::from_le_bytes(data[0..4].try_into().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("header parse failed: {e}"),
+            )
+        })?);
+        let msg_id = u32::from_le_bytes(data[4..8].try_into().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("header parse failed: {e}"),
+            )
+        })?);
+        let total_len = HEADER_SIZE + data_len as usize;
+
+        if data.len() < total_len {
+            return Ok(None);
+        }
+
+        let payload = data[8..total_len].to_vec();
+        let message = message::Message::new(msg_id, payload);
+        Ok(Some((message, total_len)))
+    }
+}

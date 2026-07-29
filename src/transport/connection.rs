@@ -24,11 +24,12 @@ use tokio::sync::{mpsc, watch};
 
 use super::handler::SharedHandler;
 use super::req::Request;
+use crate::protocol::DataPack;
 
 /// 回包队列深度。handler 生产回包比 socket 消费快时,先在这里排队。
 const WRITE_QUEUE_CAP: usize = 100;
 
-/// 一次 read 的缓冲区大小。阶段 1 接 TLV 后会换成「先读 8 字节头,再精确读 body」。
+/// 一次 read 的缓冲区大小。
 const READ_BUF_SIZE: usize = 1024;
 
 /// 一条客户端连接。
@@ -102,6 +103,8 @@ impl Connection {
         mut exit: watch::Receiver<bool>,
     ) {
         let mut buf = [0u8; READ_BUF_SIZE];
+        let mut pending = Vec::new();
+        let packer = DataPack::new();
 
         loop {
             let n = tokio::select! {
@@ -122,10 +125,14 @@ impl Connection {
                 },
             };
 
-            // 阶段 0:msgID 先固定填 1。阶段 1 接上 TLV 后由包头解析得到。
-            let req = Request::new(buf[..n].to_vec(), 1, tx.clone());
-            if let Err(e) = handler.handle(req).await {
-                eprintln!("「BanNet」处理客户端 {peer} 的请求失败: {e}");
+            pending.extend_from_slice(&buf[..n]);
+
+            while let Ok(Some((message, consumed))) = packer.unpack(&pending) {
+                pending.drain(..consumed);
+                let req = Request::new(message, tx.clone());
+                if let Err(e) = handler.handle(req).await {
+                    eprintln!("「BanNet」处理客户端 {peer} 的请求失败: {e}");
+                }
             }
         }
     }
