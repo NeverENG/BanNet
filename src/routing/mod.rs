@@ -11,6 +11,4 @@ mod request;
 mod router;
 
 // ── 本层对外暴露的 API ──
-// TODO(阶段 3):
-// pub use request::Request;
-// pub use router::Router;
+pub use router::Router;

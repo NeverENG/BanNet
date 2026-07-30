@@ -43,10 +43,12 @@ pub use server::Server;
 
 // 通用客户端 API。
 pub use client::Client;
+// 请求上下文和路由类型。
+pub use routing::Router;
+pub use transport::Request;
 // 目前导出协议类型,方便 examples/客户端直接构造 TLV 消息。
 pub use protocol::DataPack;
 pub use protocol::Message;
 
 // TODO(后续阶段逐步打开):
-// pub use routing::{Request, Router};
-//pub use transport::Connection;
+// pub use transport::Connection;

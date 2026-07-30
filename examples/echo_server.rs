@@ -1,38 +1,32 @@
-//! echo_server —— 用 BanNet 写的服务端示例(我们的北极星 🌟)
+//! router_server —— 用 BanNet 写的路由服务端示例。
 //!
-//! 运行方式(框架实现后):
+//! 运行方式:
 //!   cargo run --example echo_server
 //!
-//! ── 目标形态(北极星,阶段推进后逐步能写)──
-//! ```ignore
-//! use bannet::Server;
-//!
-//! #[tokio::main]
-//! async fn main() -> bannet::Result<()> {
-//!     let mut server = Server::builder("127.0.0.1:8999")
-//!         .workers(8)
-//!         .max_conns(10_000)
-//!         .build()?;
-//!
-//!     server.on_conn_start(|conn| println!("上线: {}", conn.id()));
-//!
-//!     server.on(1, |req| async move {
-//!         println!("收到 msgID={}, data={:?}", req.id(), req.data());
-//!         req.reply(b"pong").await
-//!     });
-//!
-//!     server.run().await
-//! }
-//! ```
+//! 这个示例展示了如何把 `msgID` 映射到不同的业务逻辑。
 
-// 阶段 0:裸字节 echo server。跑起来后,你发什么它原样回什么。
 use bannet::Server;
 
 #[tokio::main]
 async fn main() {
-    // new 现在要 3 个参数:地址、最大连接数、worker 数(后两个暂时没用上)
-    let server = Server::new("127.0.0.1:8999".to_string())
+    let mut server = Server::new("127.0.0.1:8999")
         .await
         .expect("Failed to create server");
+
+    server.on(1, |req: bannet::Request| async move {
+        let text = String::from_utf8_lossy(req.data());
+        println!("route 1 got: {}", text);
+        let reply = format!("route1 echo: {}", text);
+        req.reply(reply).await
+    });
+
+    server.on(2, |req: bannet::Request| async move {
+        let text = String::from_utf8_lossy(req.data());
+        println!("route 2 got: {}", text);
+        let reply = format!("route2 ack: {}", text);
+        req.reply(reply).await
+    });
+
+    println!("BanNet router server listening on 127.0.0.1:8999");
     _ = server.run().await;
 }

@@ -16,21 +16,45 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::error::Result;
-use crate::transport::{Connection, EchoHandler, Handler, SharedHandler};
+use crate::routing::Router;
+use crate::transport::{Connection, Handler, SharedHandler};
 
 pub struct Server {
     listener: TcpListener,
     addr: String,
     /// 业务处理器,所有连接共享同一个 `Arc`。
     handler: SharedHandler,
+    /// 只要 `Server::new` 走默认构造,这个 Router 就存在并可注册路由。
+    router: Router,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
 impl Server {
-    /// bind 端口,使用默认的 echo handler。
+    /// bind 端口,使用默认的 Router(echo fallback)。
     pub async fn new(addr: impl Into<String>) -> Result<Server> {
-        Self::with_handler(addr, EchoHandler).await
+        let router = Router::new();
+        let handler = Arc::new(router.clone()) as SharedHandler;
+        Self::with_router(addr, router, handler).await
+    }
+
+    async fn with_router(
+        addr: impl Into<String>,
+        router: Router,
+        handler: SharedHandler,
+    ) -> Result<Server> {
+        let addr = addr.into();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = TcpListener::bind(&addr).await?;
+
+        Ok(Server {
+            listener,
+            addr,
+            handler,
+            router,
+            shutdown_tx,
+            shutdown_rx,
+        })
     }
 
     /// bind 端口,并注册业务处理器。
@@ -47,13 +71,16 @@ impl Server {
             listener,
             addr,
             handler: Arc::new(handler),
+            router: Router::new(),
             shutdown_tx,
             shutdown_rx,
         })
     }
-    /// 替换业务处理器。必须在 `start()` / `run()` 之前调用。
-    pub fn on<H: Handler>(&mut self, handler: H) -> &mut Self {
-        self.handler = Arc::new(handler);
+
+    /// 注册一个路由处理器, msg_id 将由 Router 分发。
+    pub fn on<H: Handler>(&mut self, msg_id: u32, handler: H) -> &mut Self {
+        self.router.add_route(msg_id, handler);
+        self.handler = Arc::new(self.router.clone()) as SharedHandler;
         self
     }
 
