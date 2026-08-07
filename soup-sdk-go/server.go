@@ -39,6 +39,9 @@ type Config struct {
 	BudgetKbpsPerClient int
 	// Gatekeeper 是鉴权/路由/建房工厂,必填。
 	Gatekeeper Gatekeeper
+	// ReplayOut 是回放录制文件路径;非空时把交付的输入(含 seed/tickHz)
+	// 录制到该文件,配合 Replay() 离线重放(S4)。
+	ReplayOut string
 }
 
 // Server 是逻辑服 SDK 的入口。创建一个 Server 后调用 Run 进入服务循环。
@@ -235,9 +238,14 @@ func (s *Server) dispatch(typ byte, body, raw []byte) {
 		s.routeToRoom(inEvent{kind: inStats, sess: sess, rtt: rtt, loss: loss})
 
 	case FrameOverload:
-		// 全局计数由 S3 的降级策略消费;当前仅记录丢弃量(可通过日志观测)。
+		// 全局降频:通知所有房间进入降级(S3),打日志并计数。
 		if up, down, err := parseOverload(body); err == nil {
-			log.Printf("soup: 框架 Overload dropped_up=%d dropped_down=%d", up, down)
+			log.Printf("soup: 框架 Overload dropped_up=%d dropped_down=%d,快照全局降频", up, down)
+			s.roomsMu.Lock()
+			for _, r := range s.rooms {
+				r.setOverload(true)
+			}
+			s.roomsMu.Unlock()
 		}
 		s.readPool.Put(raw)
 
@@ -339,15 +347,24 @@ func (s *Server) newRoom(route RoomRoute, first PlayerID) (*room, error) {
 	}
 	impl := s.cfg.Gatekeeper.NewRoom(route.RoomID, route.Config, []PlayerID{first}, seed)
 	r := &room{
-		srv:       s,
-		id:        route.RoomID,
-		impl:      impl,
-		rand:      NewDetRand(seed),
-		inbox:     make(chan inEvent, s.inboxCap),
-		players:   make(map[PlayerID]*pstate, 8),
-		sessOf:    make(map[uint64]PlayerID, 8),
-		dtMS:      uint32(1000 / s.cfg.TickHz),
-		outFrames: make([]*Buffer, 0, 16),
+		srv:        s,
+		id:         route.RoomID,
+		impl:       impl,
+		rand:       NewDetRand(seed),
+		inbox:      make(chan inEvent, s.inboxCap),
+		players:    make(map[PlayerID]*pstate, 8),
+		sessOf:     make(map[uint64]PlayerID, 8),
+		dtMS:       uint32(1000 / s.cfg.TickHz),
+		outFrames:  make([]*Buffer, 0, 16),
+		pendingBuf: make([]pendingDeliver, 0, 8),
+	}
+	if s.cfg.ReplayOut != "" {
+		path := s.cfg.ReplayOut
+		if w, err := newReplayWriter(path, seed, s.cfg.TickHz); err == nil {
+			r.replay = w
+		} else {
+			log.Printf("soup: 回放录制打开失败 %s: %v", path, err)
+		}
 	}
 	r.ctx = &RoomCtx{r: r}
 	return r, nil

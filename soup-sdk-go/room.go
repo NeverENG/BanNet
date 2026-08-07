@@ -200,9 +200,13 @@ func (c *RoomCtx) End(result Result) {
 	r.stopReq = true
 }
 
-// RequestKeyframe 请求对某玩家强制下发一次全量快照。
-// (当前里程碑基线恒为全量,S3 基线机制落地后生效。)
-func (c *RoomCtx) RequestKeyframe(p PlayerID) {}
+// RequestKeyframe 请求对某玩家强制下发一次全量快照(下一调度即生效)。
+// 用于客户端请求纠偏、首次进入、或长时间丢包后的主动重同步。
+func (c *RoomCtx) RequestKeyframe(p PlayerID) {
+	if st, ok := c.r.players[p]; ok {
+		st.forceKeyframe = true
+	}
+}
 
 // Kick 立即踢出玩家:发 0x83 Kick 帧、调 OnLeave(LeaveKicked)并从房间移除。
 // reason 是透传给框架/客户端的踢出原因码。
@@ -233,11 +237,12 @@ func multicastHeadLen(n int) int { return 9 + 8*n }
 type inKind uint8
 
 const (
-	inOpen   inKind = iota // SessionOpen:玩家加入
-	inClose                // SessionClose:玩家离开
-	inResume               // SessionResume:断线重连
-	inData                 // Data:输入/业务消息
-	inStats                // SessionStats:更新 rtt/丢包
+	inOpen     inKind = iota // SessionOpen:玩家加入
+	inClose                  // SessionClose:玩家离开
+	inResume                 // SessionResume:断线重连
+	inData                   // Data:输入/业务消息
+	inStats                  // SessionStats:更新 rtt/丢包
+	inOverload               // Overload:全局降频
 )
 
 // inEvent 是投递给房间 goroutine 的事件。
@@ -257,11 +262,29 @@ type inEvent struct {
 }
 
 // pstate 是房间内一个玩家的会话状态(房间 goroutine 独占)。
+// S3 字段:抖动缓冲(jbuf/lastSeq/lastPayload)、基线环、带宽降级。
 type pstate struct {
-	sess    uint64
-	rtt     uint16
-	loss    uint16
-	lastSeq InputSeq
+	srv  *Server
+	sess uint64
+	rtt  uint16
+	loss uint16
+
+	lastSeq InputSeq // 已交付最大输入序号(去重基准)
+
+	// 抖动缓冲(M04)。
+	jbuf           []jitterEntry
+	jcap           int
+	jdepth         int
+	lastPayload    []byte // 缓冲为空时重复上一帧的副本(预分配,零分配)
+	lastPayloadLen int
+
+	// 基线机制(M05)。
+	lastRecvSnap  Tick // 客户端最后收到的快照 tick(输入包回传)
+	baselineRing  []Tick
+	baselineCap   int
+	bytesOut      uint32 // 本秒快照字节(降级统计)
+	degrade       int    // 降级档位 0..2(20→10→5Hz)
+	forceKeyframe bool
 }
 
 // room 是 SDK 侧的房间运行时:一个房间一个 goroutine,状态被其独占。
@@ -285,6 +308,11 @@ type room struct {
 	endResult Result
 
 	outFrames []*Buffer // 本 tick 内 Commit 的帧,flush 时统一投出站队列
+
+	// S3/S4。
+	pendingBuf []pendingDeliver // 本 tick 待交付输入(复用,零分配)
+	overload   bool             // 框架 Overload:全局降频
+	replay     *ReplayWriter    // 非 nil 时录制输入
 }
 
 // buffer 从池取一个出站缓冲。

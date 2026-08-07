@@ -41,6 +41,22 @@ type Baseline struct {
 	Valid bool // false 表示必须输出可独立解码的全量
 }
 
+// 输入帧头(ChInput,SDK 解析后剥离,OnInput 只收到用户数据)。
+//
+// 客户端上行输入 payload 布局:
+//
+//	[clientTick u32][inputSeq u16][lastRecvSnapshotTick u16][user data]
+//
+// - clientTick:客户端逻辑帧号,用于抖动缓冲排序与确定性交付
+// - inputSeq:输入序号,SDK 按它去重(客户端应冗余携带最近几帧输入)
+// - lastRecvSnapshotTick:客户端最后收到的快照 tick,SDK 据此选 baseline
+const inputHeaderLen = 8
+
+// 快照头(SDK 写入快照 payload 开头,客户端解析)。
+//
+//	[snapshotTick u32][lastProcessedInputSeq u16][room 内容]
+const snapshotHeaderLen = 6
+
 // Outcome 是房间 Tick 的返回结果。
 type Outcome uint8
 
