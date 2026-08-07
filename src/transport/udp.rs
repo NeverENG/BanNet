@@ -87,27 +87,50 @@ impl UdpReceiver {
     }
 }
 
-/// UDP 发送端:共享一个 socket,多 task 并发 send。
-#[derive(Clone)]
+/// UDP 发送端:复用接收端同一批 SO_REUSEPORT socket(收发合一)。
+///
+/// ⚠️ 为什么必须收发同一批 socket:客户端回包(ACK/上行)发往**收到的包的
+/// 源地址**。若发送走独立 socket(哪怕绑定引擎端口),要么参与 REUSEPORT
+/// 分发却从不 recv(分到的包堆积丢失),要么随机端口(客户端 ACK 发往
+/// 随机端口没人收)。只有发送源端口 == 监听端口、且该端口上的所有 socket
+/// 都参与 recv,链路才成立。
 pub struct UdpSender {
-    socket: Arc<UdpSocket>,
+    sockets: Vec<Arc<UdpSocket>>,
+    idx: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Clone for UdpSender {
+    fn clone(&self) -> Self {
+        Self {
+            sockets: self.sockets.clone(),
+            idx: self.idx.clone(),
+        }
+    }
 }
 
 impl UdpSender {
-    pub async fn bind(addr: SocketAddr) -> Result<Self> {
-        // 发送 socket 不设 SO_REUSEPORT 也可与接收共存(绑定同一端口时需设置)。
-        let socket = Arc::new(bind_reuseport(addr)?);
-        Ok(Self { socket })
+    /// 从接收端的 socket 池构造发送端(共享同一批 socket)。
+    pub fn from_receiver(receiver: &UdpReceiver) -> Self {
+        Self {
+            sockets: receiver.sockets.clone(),
+            idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// 轮询选择一个 socket 发送(源端口始终 = 引擎监听端口)。
+    fn pick(&self) -> &Arc<UdpSocket> {
+        let i = self.idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.sockets.len();
+        &self.sockets[i]
     }
 
     pub async fn send(&self, data: &[u8], peer: SocketAddr) -> Result<()> {
-        self.socket.send_to(data, peer).await?;
+        self.pick().send_to(data, peer).await?;
         Ok(())
     }
 
     /// 非阻塞发送(同步回调路径用,握手回包/心跳)。
     pub fn try_send(&self, data: &[u8], peer: SocketAddr) -> Result<()> {
-        self.socket.try_send_to(data, peer)?;
+        self.pick().try_send_to(data, peer)?;
         Ok(())
     }
 }

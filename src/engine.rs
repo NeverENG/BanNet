@@ -149,7 +149,9 @@ impl Engine {
 
         // ── UDP 收发 ──
         let receiver = UdpReceiver::bind(cfg.bind_addr, cfg.udp_workers).await?;
-        let sender = UdpSender::bind(cfg.bind_addr).await?;
+        // 收发合一:发送复用同一批 SO_REUSEPORT socket,保证源端口 = 监听端口
+        //(客户端回包发往收到的包源地址,源端口不对链路就断)。
+        let sender = UdpSender::from_receiver(&receiver);
         let actual_addr = receiver.local_addr()?;
         tracing::info!(%actual_addr, uds = %cfg.uds_path.display(), "soup-engine 启动");
 
@@ -168,8 +170,7 @@ impl Engine {
                     // 握手回包走非阻塞发送;失败即丢弃(客户端会重试)。
                     let _ = sender.try_send(bytes, peer);
                 };
-                let events =
-                    shared.sessions.handle_datagram(peer, data, &mut send_back, Instant::now());
+                let events = shared.sessions.handle_datagram(peer, data, &mut send_back, Instant::now());
                 for ev in events {
                     push_up(&shared, &ev);
                 }

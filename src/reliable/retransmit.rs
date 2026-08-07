@@ -117,6 +117,7 @@ fn seq_newer(a: u16, b: u16) -> bool {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn t0() -> Instant {
         Instant::now()
     }

@@ -110,6 +110,9 @@ async fn echo_logic(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
 }
 
 /// 单客户端负载:发 ping → 收 echo,统计 RTT。
+///
+/// 一个 socket、一个收包 task:收到 echo 匹配 pending 记 RTT,其余回 ACK。
+/// ⚠️ 不能「主循环 try_recv + 后台 task recv」双收 —— 包会被任一方抢走。
 async fn client_worker(
     id: usize,
     engine_addr: std::net::SocketAddr,
@@ -121,57 +124,89 @@ async fn client_worker(
     let (conn_id, secret) = handshake(&sock, engine_addr).await;
     let interval = Duration::from_micros(1_000_000 / pps.max(1));
 
-    // ACK 回包循环(不回 ack 会触发引擎重传堆积;连续交付语义)。
-    let sock_ack = sock.clone();
-    let ack_task = tokio::spawn(async move {
+    // 待确认 ping:seq → 发送时刻(ack_task 与主循环共享)。
+    let pending: Arc<std::sync::Mutex<std::collections::HashMap<u16, Instant>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let prefix = format!("ping-{id}-");
+
+    // 唯一收包 task:回 ACK(连续交付语义)+ 匹配 echo 记 RTT。
+    let sock_rx = sock.clone();
+    let pending_rx = pending.clone();
+    let rtts_rx = rtts.clone();
+    let secret_rx = secret;
+    let prefix_rx = prefix.clone();
+    let rx_task = tokio::spawn(async move {
         let mut buf = [0u8; MTU];
-        let mut ack_pos = 0u16; // 已连续收到位置(引擎 send_seq 从 0 开始)
+        // ack_pos = 已连续收到的最后一个 seq;从 -1 开始,收到 0 才推进到 0。
+        let mut ack_pos = u16::MAX;
         let mut seen: std::collections::VecDeque<u16> = std::collections::VecDeque::new();
         loop {
-            let (n, peer) = sock_ack.recv_from(&mut buf).await.unwrap();
-            if let Ok((h, _)) = decode(&buf[..n]) {
-                // 记录收到并推进连续位置。
-                if !seen.contains(&h.seq) {
-                    seen.push_back(h.seq);
-                    while seen.len() > 512 {
-                        seen.pop_front();
+            let (n, peer) = sock_rx.recv_from(&mut buf).await.unwrap();
+            let raw = &buf[..n];
+            // 校验并剥离 HMAC。
+            let data = if raw.len() >= 20 && raw[3] & FLAG_HMAC != 0 {
+                let (d, m) = raw.split_at(raw.len() - 4);
+                if hmac4(&secret_rx, d) != m {
+                    continue;
+                }
+                d
+            } else {
+                raw
+            };
+            let Ok((h, frames)) = decode(data) else {
+                continue;
+            };
+            // echo 匹配。
+            for f in frames {
+                if f.ch == CH_RELIABLE_ORDERED {
+                    let p = String::from_utf8_lossy(f.body);
+                    if let Some(rest) = p.strip_prefix(&prefix_rx) {
+                        if let Ok(sq) = rest.parse::<u16>() {
+                            if let Some(t0) = pending_rx.lock().unwrap().remove(&sq) {
+                                let rtt = t0.elapsed().as_secs_f64() * 1000.0;
+                                rtts_rx.lock().unwrap().push(rtt);
+                            }
+                        }
                     }
                 }
-                while seen.contains(&ack_pos.wrapping_add(1)) {
-                    ack_pos = ack_pos.wrapping_add(1);
+            }
+            // 记录收到并推进连续位置,回 ACK。
+            if !seen.contains(&h.seq) {
+                seen.push_back(h.seq);
+                while seen.len() > 512 {
+                    seen.pop_front();
                 }
-                // 位图:ack 之后 32 个的收到情况。
-                let mut ack_bits = 0u32;
-                for i in 1..=32u32 {
-                    if seen.contains(&ack_pos.wrapping_add(i as u16)) {
-                        ack_bits |= 1 << (i - 1);
-                    }
+            }
+            while seen.contains(&ack_pos.wrapping_add(1)) {
+                ack_pos = ack_pos.wrapping_add(1);
+            }
+            let mut ack_bits = 0u32;
+            for i in 1..=32u32 {
+                if seen.contains(&ack_pos.wrapping_add(i as u16)) {
+                    ack_bits |= 1 << (i - 1);
                 }
-                let resp = DatagramHeader {
-                    version: VERSION,
-                    flags: FLAG_PURE_ACK,
-                    conn_id: h.conn_id,
-                    seq: 0,
-                    ack: ack_pos,
-                    ack_bits,
-                };
-                let mut out = Vec::with_capacity(HEADER_LEN);
-                if encode(&resp, &[], &mut out).is_ok() {
-                    let _ = sock_ack.send_to(&out, peer).await;
-                }
+            }
+            let resp = DatagramHeader {
+                version: VERSION,
+                flags: FLAG_PURE_ACK,
+                conn_id: h.conn_id,
+                seq: 0,
+                ack: ack_pos,
+                ack_bits,
+            };
+            let mut out = Vec::with_capacity(HEADER_LEN);
+            if encode(&resp, &[], &mut out).is_ok() {
+                let _ = sock_rx.send_to(&out, peer).await;
             }
         }
     });
-    let _ = ack_task;
+    let _ = rx_task;
 
-    // 压测主循环:发 ping → 收 echo,按 payload 匹配 RTT。
+    // 压测主循环:只发 ping(seq 从 0 递增)。
     let start = Instant::now();
     let mut sent = 0u64;
     let mut seq = 0u16;
-    let mut recv_buf = [0u8; MTU];
-    let mut pending: std::collections::HashMap<u16, Instant> = std::collections::HashMap::new();
     while start.elapsed() < duration {
-        seq = seq.wrapping_add(1);
         let payload = format!("ping-{id}-{seq}").into_bytes();
         let header = DatagramHeader {
             version: VERSION,
@@ -187,47 +222,14 @@ async fn client_worker(
         let mac = hmac4(&secret, &buf);
         buf.extend_from_slice(&mac);
         sock.send_to(&buf, engine_addr).await.unwrap();
-        pending.insert(seq, Instant::now());
+        pending.lock().unwrap().insert(seq, Instant::now());
         sent += 1;
-
-        // 收 echo(非阻塞扫描)。
-        let prefix = format!("ping-{id}-");
-        while let Ok((n, _)) = sock.try_recv_from(&mut recv_buf) {
-            // 校验并剥离 HMAC。
-            let data = {
-                let raw = &recv_buf[..n];
-                if raw.len() >= 20 && raw[3] & FLAG_HMAC != 0 {
-                    let (d, m) = raw.split_at(raw.len() - 4);
-                    if hmac4(&secret, d) != m {
-                        continue;
-                    }
-                    d
-                } else {
-                    raw
-                }
-            };
-            if let Ok((_, frames)) = decode(data) {
-                for f in frames {
-                    if f.ch == CH_RELIABLE_ORDERED {
-                        let p = String::from_utf8_lossy(f.body);
-                        if let Some(rest) = p.strip_prefix(&prefix) {
-                            if let Ok(sq) = rest.parse::<u16>() {
-                                if let Some(t0) = pending.remove(&sq) {
-                                    let rtt = t0.elapsed().as_secs_f64() * 1000.0;
-                                    rtts.lock().unwrap().push(rtt);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        seq = seq.wrapping_add(1);
         tokio::time::sleep(interval).await;
     }
-    let lost = pending.len() as u64;
+    let lost = pending.lock().unwrap().len() as u64;
     (sent, lost)
 }
-
 #[tokio::main]
 async fn main() -> soup_engine::Result<()> {
     let args = parse_args();
@@ -236,9 +238,10 @@ async fn main() -> soup_engine::Result<()> {
         .try_init();
 
     // 引擎地址:--addr 或本地起一套。
-    let engine_addr: std::net::SocketAddr = if let Some(a) = &args.addr {
-        a.parse().expect("--addr 格式: 127.0.0.1:PORT")
-    } else {
+    let (engine_addr, engine_opt): (std::net::SocketAddr, Option<(Arc<Engine>, tokio::sync::watch::Sender<bool>)>) =
+        if let Some(a) = &args.addr {
+            (a.parse().expect("--addr 格式: 127.0.0.1:PORT"), None)
+        } else {
         let uds_path =
             std::env::temp_dir().join(format!("engineload-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&uds_path);
@@ -262,8 +265,8 @@ async fn main() -> soup_engine::Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        let _ = tx;
-        addr
+        // ⚠️ 必须持有 tx:watch sender 一旦 drop,rx.changed() 立即返回,引擎退出。
+        (addr, Some((engine, tx)))
     };
 
     eprintln!(
@@ -316,5 +319,13 @@ async fn main() -> soup_engine::Result<()> {
     eprintln!("未确认(丢/超时): {total_lost}");
     eprintln!("RTT p50     : {p50:.1} ms");
     eprintln!("RTT p99     : {p99:.1} ms");
+    // 引擎指标(仅本地引擎)。
+    if let Some((engine, tx)) = engine_opt.as_ref() {
+        let st = engine.sessions().stats.snapshot();
+        eprintln!("引擎指标    : sessions={} pkt_in={} pkt_out={} pkt_bad={} dropped_up={} retransmits={} acks_seen={}",
+            st.sessions_active, st.pkt_in, st.pkt_out, st.pkt_bad, st.dropped_up, st.retransmits, st.acks_seen);
+        // 压测结束,关引擎。
+        let _ = tx.send(true);
+    }
     Ok(())
 }
