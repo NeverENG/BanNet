@@ -19,3 +19,36 @@ type Gatekeeper interface {
 	// 自身的确定性逻辑(可通过 ctx.Rand() 使用)。
 	NewRoom(roomID RoomID, cfg any, players []PlayerID, seed uint64) Room
 }
+
+// GatekeeperFuncs 是用函数字段实现 Gatekeeper 的便捷类型:
+// 免去为每个方法写空实现,常用于快速原型与示例。
+// 字段为 nil 时对应方法返回安全默认值(拒绝 / 默认加入 / 空房间)。
+type GatekeeperFuncs struct {
+	// AuthenticateFn 对应 Gatekeeper.Authenticate;nil 表示拒绝所有连接。
+	AuthenticateFn func(token []byte, addr string) *PlayerID
+	// RouteFn 对应 Gatekeeper.Route;nil 表示默认加入 room 0。
+	RouteFn func(p PlayerID, hint JoinHint) RoomRoute
+	// NewRoomFn 对应 Gatekeeper.NewRoom;nil 表示建房失败。
+	NewRoomFn func(roomID RoomID, cfg any, players []PlayerID, seed uint64) Room
+}
+
+func (f GatekeeperFuncs) Authenticate(token []byte, addr string) *PlayerID {
+	if f.AuthenticateFn == nil {
+		return nil
+	}
+	return f.AuthenticateFn(token, addr)
+}
+
+func (f GatekeeperFuncs) Route(p PlayerID, hint JoinHint) RoomRoute {
+	if f.RouteFn == nil {
+		return RoomRoute{Action: RouteJoin, RoomID: 0}
+	}
+	return f.RouteFn(p, hint)
+}
+
+func (f GatekeeperFuncs) NewRoom(roomID RoomID, cfg any, players []PlayerID, seed uint64) Room {
+	if f.NewRoomFn == nil {
+		return nil
+	}
+	return f.NewRoomFn(roomID, cfg, players, seed)
+}
