@@ -42,11 +42,11 @@ func main() {
 	socket := flag.String("socket", "/tmp/soup-interop.sock", "引擎监听的 UDS 路径")
 	flag.Parse()
 
-	srv := soup.NewServer(soup.Config{
-		EngineSocket: *socket,
-		TickHz:       20,
-		SnapshotHz:   10,
-		Gatekeeper: soup.GatekeeperFuncs{
+	srv := soup.NewServer(
+		soup.WithEngineSocket(*socket),
+		soup.WithTickHz(20),
+		soup.WithSnapshotHz(10),
+		soup.WithGatekeeper(soup.GatekeeperFuncs{
 			AuthenticateFn: func(token []byte, addr string) *soup.PlayerID {
 				p := soup.PlayerID(1)
 				return &p
@@ -57,8 +57,8 @@ func main() {
 			NewRoomFn: func(id soup.RoomID, cfg any, players []soup.PlayerID, seed uint64) soup.Room {
 				return &echoRoom{}
 			},
-		},
-	})
+		}),
+	)
 	log.Printf("soup-sdk-go 逻辑服启动,监听 %s", *socket)
 	srv.Run(context.Background())
 }

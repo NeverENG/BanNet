@@ -6,6 +6,7 @@
 
 - 用 **TCP** 做对战 → 一丢包全卡住(队头阻塞),延迟抖动直接劝退玩家
 - 裸写 **UDP** → 握手、丢包重传、乱序、断线重连、防作弊……每个都是几个月的坑
+- 同一套协议还支持 **TCP / WebSocket** 客户端(浏览器/H5、防火墙后内网),协议零分叉
 
 soup-engine 把这些全部做完。你只写游戏规则(Go),**一个房间一个 tick 循环**,客户端连上就连上了,断了自动续,逻辑服崩了重启都不掉线。
 
@@ -88,16 +89,16 @@ func (r *room) EncodeFullState(t soup.PlayerID, out *soup.Buffer)            {}
 func (r *room) StateHash() uint64                                            { return 0 }
 
 func main() {
-    srv := soup.NewServer(soup.Config{
-        EngineSocket: "/tmp/soup.sock", // 引擎监听的 UDS 路径
-        TickHz:       20,
-        Gatekeeper: soup.GatekeeperFuncs{
+    srv := soup.NewServer( // options 模式:没写的全走默认值
+        soup.WithEngineSocket("/tmp/soup.sock"), // 引擎监听的 UDS 路径
+        soup.WithTickHz(20),
+        soup.WithGatekeeper(soup.GatekeeperFuncs{
             AuthenticateFn: func(token []byte, addr string) *soup.PlayerID { p := soup.PlayerID(1); return &p },
             RouteFn:        func(p soup.PlayerID, h soup.JoinHint) soup.RoomRoute { return soup.RoomRoute{Action: soup.RouteJoin, RoomID: 1} },
             NewRoomFn:      func(id soup.RoomID, cfg any, players []soup.PlayerID, seed uint64) soup.Room { return &room{} },
-        },
-    })
-    srv.Run() // 阻塞;引擎连上来即开始干活
+        }),
+    )
+    srv.Run(context.Background()) // 阻塞;引擎连上来即开始干活
 }
 ```
 

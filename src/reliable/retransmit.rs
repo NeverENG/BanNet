@@ -7,7 +7,7 @@
 //! `ack_bits` 是 ack 之前 32 个包的位图。条目确认窗口 = [ack-32, ack],
 //! 窗口外的旧条目一律视为已确认(对端推进过了)。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
@@ -26,6 +26,8 @@ pub struct PendingPacket {
 #[derive(Debug, Default, Clone)]
 pub struct RetransmitQueue {
     entries: VecDeque<PendingPacket>,
+    /// KCP 模式快速重传:seq → 被 ACK 连续跳过的次数。
+    skip_count: HashMap<u16, u8>,
 }
 
 impl RetransmitQueue {
@@ -61,19 +63,39 @@ impl RetransmitQueue {
     ///
     /// ⚠️ 不做「ack 窗口外清理」:对端位图只有 32 位,窗口外的未确认
     /// 条目可能真的丢了(客户端从未收到),必须靠 RTO 重传而不是误判已确认。
-    pub fn on_ack(&mut self, ack: u16, ack_bits: u32, now: Instant) -> (Vec<u16>, Option<f64>) {
+    pub fn on_ack(
+        &mut self,
+        ack: u16,
+        ack_bits: u32,
+        now: Instant,
+    ) -> (Vec<u16>, Option<f64>, Vec<Vec<u8>>) {
         let mut acked = Vec::new();
         let mut rtt_sample = None;
+        let mut fast_retransmit = Vec::new();
+        // KCP 模式快速重传:队首未被确认时,累计「被跳过」计数,
+        // 连续被跳过 >= 2 次立即重传(不等 RTO),收敛空洞。
+        if let Some(front) = self.entries.front() {
+            if !is_acked(front.seq, ack, ack_bits) {
+                let n = self.skip_count.entry(front.seq).or_insert(0u8);
+                *n += 1;
+                if *n >= 2 {
+                    if let Some(entry) = self.entries.front() {
+                        fast_retransmit.push(entry.datagram.clone());
+                    }
+                }
+            }
+        }
         while let Some(front) = self.entries.front() {
             if is_acked(front.seq, ack, ack_bits) {
                 rtt_sample = Some(now.duration_since(front.sent_at).as_secs_f64() * 1000.0);
                 acked.push(front.seq);
+                self.skip_count.remove(&front.seq);
                 self.entries.pop_front();
             } else {
                 break;
             }
         }
-        (acked, rtt_sample)
+        (acked, rtt_sample, fast_retransmit)
     }
 
     /// RTT 采样已并入 on_ack(条目弹出后无法回溯)。此方法保留供测试。
@@ -130,7 +152,7 @@ mod tests {
         q.push(2, vec![2], now).unwrap();
         q.push(3, vec![3], now).unwrap();
         // ack=2:连续交付语义下 1、2 隐含确认;3 靠位图 bit0(ack 后第 1 个)。
-        let (acked, rtt) = q.on_ack(2, 0b1, now);
+        let (acked, rtt, _fast) = q.on_ack(2, 0b1, now);
         assert_eq!(acked, vec![1, 2, 3]);
         assert!(rtt.is_some());
         assert!(q.is_empty());
@@ -144,14 +166,14 @@ mod tests {
             q.push(i, vec![i as u8], now).unwrap();
         }
         // 连续 ACK 语义:ack=7 隐含确认 0..7;位图全置位再确认 8、9(ack 后乱序)。
-        let (acked, _) = q.on_ack(7, 0xFFFF_FFFF, now);
+        let (acked, _, _fast) = q.on_ack(7, 0xFFFF_FFFF, now);
         assert_eq!(acked, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert!(q.is_empty());
         // 位图全 0:只确认 ack 及之前,ack 之后的乱序包保留等待。
         for i in 0..10u16 {
             q.push(i, vec![i as u8], now).unwrap();
         }
-        let (acked, _) = q.on_ack(7, 0, now);
+        let (acked, _, _fast) = q.on_ack(7, 0, now);
         assert_eq!(acked, (0..=7).collect::<Vec<u16>>());
         assert_eq!(q.len(), 2);
     }
@@ -164,13 +186,13 @@ mod tests {
             q.push(i, vec![i as u8], now).unwrap();
         }
         // 连续 ACK:ack=9 隐含确认 0..9;位图全 0 时 10..39 保留等乱序位图或推进。
-        let (acked, _) = q.on_ack(9, 0, now);
+        let (acked, _, _fast) = q.on_ack(9, 0, now);
         assert_eq!(acked, (0..=9).collect::<Vec<u16>>());
         assert_eq!(q.len(), 30);
         // 模拟客户端逐包 ACK:ack 推进 10..39,每条隐含确认自身及之前。
         let mut total = 10;
         for ack in 10..40u16 {
-            let (acked, _) = q.on_ack(ack, 0, now);
+            let (acked, _, _fast) = q.on_ack(ack, 0, now);
             assert_eq!(acked, vec![ack], "ack={ack} 应确认自身");
             total += 1;
         }
@@ -180,7 +202,7 @@ mod tests {
         for i in 0..40u16 {
             q.push(i, vec![i as u8], now).unwrap();
         }
-        let (acked, _) = q.on_ack(39, 0, now);
+        let (acked, _, _fast) = q.on_ack(39, 0, now);
         assert_eq!(acked.len(), 40);
         assert!(q.is_empty());
     }
@@ -222,7 +244,30 @@ mod tests {
         for i in [65534u16, 65535, 0, 1] {
             q.push(i, vec![], now).unwrap();
         }
-        let (acked, _) = q.on_ack(1, 0xFFFF_FFFF, now);
+        let (acked, _, _fast) = q.on_ack(1, 0xFFFF_FFFF, now);
         assert_eq!(acked, vec![65534, 65535, 0, 1]);
     }
+#[test]
+fn fast_retransmit_after_skips() {
+    let mut q = RetransmitQueue::new();
+    let now = t0();
+    q.push(1, vec![1u8], now).unwrap();
+    q.push(2, vec![2u8], now).unwrap();
+    q.push(3, vec![3u8], now).unwrap();
+    // ACK=0 位图 0:队首 seq=1 未被确认(空洞),第 1 次跳过。
+    let (acked, _, fast) = q.on_ack(0, 0, now);
+    assert!(acked.is_empty());
+    assert!(fast.is_empty(), "第 1 次跳过不触发快速重传");
+    // 第 2 次跳过:立即重传队首(不等 RTO)。
+    let (acked, _, fast) = q.on_ack(0, 0, now);
+    assert!(acked.is_empty());
+    assert_eq!(fast.len(), 1, "连续 2 次跳过应触发快速重传");
+    assert_eq!(fast[0], vec![1u8]);
+    // 确认 seq=1 后,跳过计数清除,后续空洞重新计数。
+    let (acked, _, fast) = q.on_ack(1, 0, now);
+    assert_eq!(acked, vec![1]);
+    assert!(fast.is_empty());
+    assert_eq!(q.len(), 2);
+}
+
 }

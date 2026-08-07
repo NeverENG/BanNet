@@ -72,19 +72,27 @@ type outFrame struct {
 	buf  *Buffer
 }
 
-// NewServer 创建 Server 并填充默认配置。
-func NewServer(cfg Config) *Server {
+// NewServer 创建 Server。使用函数式选项装配(见 options.go):
+//
+//	srv := soup.NewServer(
+//	    soup.WithEngineSocket("/tmp/s.sock"),
+//	    soup.WithTickHz(20),
+//	    soup.WithGatekeeper(gk),
+//	)
+//
+// 未显式设置的项全部走安全默认值;整体覆盖可用 WithConfig。
+func NewServer(opts ...Option) *Server {
+	cfg := defaultConfig()
+	for _, o := range opts {
+		o(&cfg)
+	}
+	// 防御性兜底(直接 WithConfig 覆盖为半空值时也安全)。
+	// 注意:SnapshotHz=0 与 KeyframeIntervalTicks=0 是合法"禁用"值,不兜底。
 	if cfg.TickHz <= 0 {
 		cfg.TickHz = 20
 	}
-	if cfg.SnapshotHz <= 0 {
-		cfg.SnapshotHz = 20
-	}
 	if cfg.JitterBufferTicks <= 0 {
 		cfg.JitterBufferTicks = 2
-	}
-	if cfg.KeyframeIntervalTicks <= 0 {
-		cfg.KeyframeIntervalTicks = 100
 	}
 	if cfg.BaselineRingSize <= 0 {
 		cfg.BaselineRingSize = 32

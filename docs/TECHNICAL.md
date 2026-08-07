@@ -229,3 +229,56 @@ cargo run --release --example interop -- --uds /tmp/soup-interop.sock --count 5
 **症状**:想关快照做对照实验,反而每 tick 发快照(10Hz → 20Hz)。
 **根因**:`snapshotHz()` 的 `if hz < 1 { hz = 1 }` 把 0 兜底成 1。
 **修复**:`SnapshotHz <= 0` 直接返回 0(禁用),不再兜底。
+
+---
+
+## 9. 多传输层与生命周期优化(调研驱动)
+
+对照 Unity NGO / Mirror / KCP / Photon / Nakama / PlayFab / QUIC(RFC9000)
+调研后落地 4 项:
+
+### 9.1 多传输:UDP / TCP / WebSocket 三端,协议零分叉
+
+| 传输 | 入口 | 客户端形态 | 报文封装 |
+|------|------|-----------|---------|
+| UDP(默认) | `bind_addr` | 原生游戏客户端 | datagram 报文 = 报文 |
+| TCP | `tcp_bind_addr` | 内网/防火墙后客户端 | 4B 长度前缀 + 报文 |
+| WebSocket | `ws_bind_addr` | 浏览器/H5 | 二进制消息 = 报文(WS 自带边界) |
+
+TCP/WS 各自维护「虚拟 peer」(127.0.0.2/127.0.0.3 段),接入后走与 UDP
+完全相同的 `handle_datagram` 路径:握手、HMAC、会话、可靠层、NAT 漂移
+(带 conn_id 重连)全部复用。下行按 peer 分流(send_outbound 三路判断)。
+WS 依赖 `tokio-tungstenite`;消息有序可靠,重传基本不触发。
+
+### 9.2 KCP 模式快速重传
+
+调研:skywind3000 KCP 的「收到 ACK 发现某 seq 被跳过 2 次即直接重传,
+不等 RTO」。落地到 `retransmit.rs::on_ack`:
+- 队首未被确认时累计 `skip_count[seq]`,连续被跳过 ≥2 次 → 立即重发;
+- 确认后清除计数。
+- 拥塞控制:本就非退让(窗口由发送缓存控制,不做丢包退让),与 kcp2k
+  「Congestion Control should be left disabled」建议一致。
+
+### 9.3 drain 生命周期(PlayFab + QUIC 模式)
+
+- 引擎关闭(`Ctrl-C`/watch 信号):`shutdown_all()` 先广播全部 SessionClose
+  给逻辑服,留 300ms 收尾窗口再退出 —— 逻辑服能感知每个玩家离开,而不是
+  连接突然消失(PlayFab 的 drain 停机语义)。
+- 客户端断连(TCP/WS 连接断开、UDP 静默)都走既有的宽限期回收 + conn_id
+  重连恢复(QUIC Connection Migration 对应物)。
+
+### 9.4 Go SDK 函数式选项模式
+
+`NewServer(opts ...Option)` 替代原 `NewServer(Config)`:
+
+```go
+srv := soup.NewServer(
+    soup.WithEngineSocket("/tmp/s.sock"),
+    soup.WithTickHz(20),
+    soup.WithSnapshotHz(10),
+    soup.WithGatekeeper(gk),
+)
+```
+
+11 个 Option + `WithConfig(Config)` 整体覆盖;`SnapshotHz=0`/`KeyframeIntervalTicks=0`
+是合法禁用值,不再被兜底覆盖。

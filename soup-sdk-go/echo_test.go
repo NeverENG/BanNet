@@ -102,12 +102,12 @@ func TestEchoThroughSDK(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	srv := NewServer(Config{
-		EngineSocket: path,
-		TickHz:       20,
-		SnapshotHz:   20,
-		Gatekeeper:   echoGK{},
-	})
+	srv := NewServer(
+		WithEngineSocket(path),
+		WithTickHz(20),
+		WithSnapshotHz(20),
+		WithGatekeeper(echoGK{}),
+	)
 	go func() { _ = srv.Run(ctx) }()
 
 	// SDK 是 UDS 监听端;引擎侧 dial 过去(架构:引擎主动连逻辑服)。
@@ -166,11 +166,11 @@ func TestSplitSessionOpen(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	srv := NewServer(Config{
-		EngineSocket: path,
-		TickHz:       20,
-		Gatekeeper:   echoGK{},
-	})
+	srv := NewServer(
+		WithEngineSocket(path),
+		WithTickHz(20),
+		WithGatekeeper(echoGK{}),
+	)
 	go func() { _ = srv.Run(ctx) }()
 
 	conn := dialEngine(t, path)

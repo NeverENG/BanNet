@@ -54,6 +54,12 @@ pub struct EngineConfig {
     pub uds_path: PathBuf,
     /// SO_REUSEPORT socket 数(通常 = 核数)。
     pub udp_workers: usize,
+    /// 可选 TCP 监听地址(客户端 TCP 传输,虚拟 peer 复用 datagram 协议)。
+    /// `None`(默认)表示不启用 TCP。
+    pub tcp_bind_addr: Option<SocketAddr>,
+    /// 可选 WebSocket 监听地址(浏览器/H5 客户端桥)。
+    /// `None`(默认)表示不启用。
+    pub ws_bind_addr: Option<SocketAddr>,
     /// 会话表配置。
     pub session: SessionTableConfig,
     /// EngineHello 的 version / caps。
@@ -67,6 +73,8 @@ impl Default for EngineConfig {
             bind_addr: "0.0.0.0:0".parse().unwrap(),
             uds_path: PathBuf::from("/run/soup-engine.sock"),
             udp_workers: num_cpus(),
+            tcp_bind_addr: None,
+            ws_bind_addr: None,
             session: SessionTableConfig::default(),
             version: VERSION as u16,
             caps: 0,
@@ -94,6 +102,14 @@ struct Shared {
     up_tx: RwLock<Option<mpsc::Sender<Frame>>>,
     /// UDP 实际监听地址(绑定后写入,供测试/工具查询)。
     bound_udp: Mutex<Option<SocketAddr>>,
+    /// TCP 实际监听地址(启用 TCP 传输时写入)。
+    bound_tcp: Mutex<Option<SocketAddr>>,
+    /// WS 实际监听地址(启用 WS 传输时写入)。
+    bound_ws: Mutex<Option<SocketAddr>>,
+    /// TCP 接收端引用(启用 TCP 传输时注入,下行分流用)。
+    tcp_receiver: Mutex<Option<Arc<crate::transport::tcp::TcpReceiver>>>,
+    /// WS 接收端引用(启用 WS 传输时注入,下行分流用)。
+    ws_receiver: Mutex<Option<Arc<crate::transport::ws::WsReceiver>>>,
     /// 逻辑服上次在线时刻(热重启补发 SessionResume 的 gap 基准)。
     logic_last_online: Mutex<Instant>,
 }
@@ -111,6 +127,10 @@ impl Shared {
             udp_sender: Mutex::new(None),
             up_tx: RwLock::new(None),
             bound_udp: Mutex::new(None),
+            bound_tcp: Mutex::new(None),
+            bound_ws: Mutex::new(None),
+            tcp_receiver: Mutex::new(None),
+            ws_receiver: Mutex::new(None),
             logic_last_online: Mutex::new(Instant::now()),
         }
     }
@@ -146,6 +166,16 @@ impl Engine {
         *self.shared.bound_udp.lock().unwrap()
     }
 
+    /// WS 实际监听地址(启用 WS 传输时可用)。
+    pub fn ws_addr(&self) -> Option<SocketAddr> {
+        *self.shared.bound_ws.lock().unwrap()
+    }
+
+    /// TCP 实际监听地址(启用 TCP 传输时可用)。
+    pub fn tcp_addr(&self) -> Option<SocketAddr> {
+        *self.shared.bound_tcp.lock().unwrap()
+    }
+
     pub async fn run(self) -> Result<()> {
         let (_tx, rx) = watch::channel(false);
         self.run_with_shutdown(rx).await
@@ -166,6 +196,73 @@ impl Engine {
         // 下行发送端注入共享状态。
         *self.shared.udp_sender.lock().unwrap() = Some(sender.clone());
         *self.shared.bound_udp.lock().unwrap() = Some(actual_addr);
+
+        // ── TCP 传输(可选):每连接一个虚拟 peer,复用同一套 datagram 处理 ──
+        let tcp_handle = if let Some(tcp_addr) = cfg.tcp_bind_addr {
+            let tcp = Arc::new(crate::transport::tcp::TcpReceiver::bind(tcp_addr).await?);
+            let tcp_actual = tcp.local_addr()?;
+            tracing::info!(%tcp_actual, "TCP 传输已启用");
+            *self.shared.bound_tcp.lock().unwrap() = Some(tcp_actual);
+            *self.shared.tcp_receiver.lock().unwrap() = Some(tcp.clone());
+            let shared = self.shared.clone();
+            let tcp_for_send = tcp.clone();
+            let recv_handler: Arc<crate::transport::tcp::PacketHandler> = Arc::new(
+                move |data: &[u8], peer: SocketAddr| {
+                    let shared = shared.clone();
+                    let tcp = tcp_for_send.clone();
+                    let mut send_back = |bytes: &[u8], peer: SocketAddr| {
+                        // TCP 回包:投递到对应连接的写通道(满则丢弃,客户端会重试)。
+                        let tcp = tcp.clone();
+                        let bytes = bytes.to_vec();
+                        tokio::spawn(async move {
+                            tcp.try_send(&bytes, peer).await;
+                        });
+                    };
+                    let events = shared.sessions.handle_datagram(peer, data, &mut send_back, Instant::now());
+                    for ev in events {
+                        push_up(&shared, &ev);
+                    }
+                },
+            );
+            Some(tokio::spawn(async move {
+                let _ = tcp.run(recv_handler).await;
+            }))
+        } else {
+            None
+        };
+
+        // ── WS 传输(可选):浏览器/H5 客户端,消息即报文 ──
+        let ws_handle = if let Some(ws_addr) = cfg.ws_bind_addr {
+            let ws = Arc::new(crate::transport::ws::WsReceiver::bind(ws_addr).await?);
+            let ws_actual = ws.local_addr()?;
+            tracing::info!(%ws_actual, "WS 传输已启用");
+            *self.shared.bound_ws.lock().unwrap() = Some(ws_actual);
+            *self.shared.ws_receiver.lock().unwrap() = Some(ws.clone());
+            let shared = self.shared.clone();
+            let ws_for_send = ws.clone();
+            let recv_handler: Arc<crate::transport::ws::PacketHandler> = Arc::new(
+                move |data: &[u8], peer: SocketAddr| {
+                    let shared = shared.clone();
+                    let ws = ws_for_send.clone();
+                    let mut send_back = |bytes: &[u8], peer: SocketAddr| {
+                        let ws = ws.clone();
+                        let bytes = bytes.to_vec();
+                        tokio::spawn(async move {
+                            ws.try_send(&bytes, peer).await;
+                        });
+                    };
+                    let events = shared.sessions.handle_datagram(peer, data, &mut send_back, Instant::now());
+                    for ev in events {
+                        push_up(&shared, &ev);
+                    }
+                },
+            );
+            Some(tokio::spawn(async move {
+                let _ = ws.run(recv_handler).await;
+            }))
+        } else {
+            None
+        };
 
         // ── UDP recv handler:同步回调(绝不 await,绝不阻塞)──
         let shared = self.shared.clone();
@@ -218,9 +315,25 @@ impl Engine {
             _ = ctrl_c => tracing::info!("收到 Ctrl-C,引擎退出"),
             _ = shutdown.changed() => tracing::info!("收到关闭信号,引擎退出"),
         }
+
+        // ── drain(PlayFab 模式):广播 SessionClose 给逻辑服,留收尾窗口 ──
+        let drain_events = self.shared.sessions.shutdown_all();
+        let shared = self.shared.clone();
+        for ev in drain_events {
+            push_up(&shared, &ev);
+        }
+        // 等 UDS 写循环把 SessionClose 刷出去(背压时最多 300ms)。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
         recv_handle.abort();
         uds_handle.abort();
         maint_handle.abort();
+        if let Some(h) = tcp_handle {
+            h.abort();
+        }
+        if let Some(h) = ws_handle {
+            h.abort();
+        }
         Ok(())
     }
 }
@@ -427,7 +540,8 @@ async fn handle_logic_frame(frame: &Frame, shared: &Arc<Shared>) -> Result<()> {
     Ok(())
 }
 
-/// 把一条 Send 帧打包成 UDP 数据报发出(可能分片为多包)。
+/// 把一条 Send 帧打包成数据报发出(可能分片为多包)。
+/// 按会话 peer 分流:虚拟 peer(127.0.0.2/8)走 TCP,其余走 UDP。
 async fn send_outbound(shared: &Arc<Shared>, sess_id: u64, ch: u8, msg_id: u16, payload: &[u8]) {
     match shared.sessions.pack_outbound(sess_id, ch, msg_id, payload) {
         Ok(packets) => {
@@ -441,11 +555,29 @@ async fn send_outbound(shared: &Arc<Shared>, sess_id: u64, ch: u8, msg_id: u16, 
                 tracing::debug!(sess_id, "逐会话带宽超限,丢弃下行");
                 return;
             }
-            // 先 clone 出发送端再 await,避免 MutexGuard 跨 await 持有。
+            // 先取发送端再 await,避免 MutexGuard 跨 await 持有。
             let sender = shared.udp_sender.lock().unwrap().clone();
-            if let Some(sender) = sender {
-                let mut sent = 0usize;
-                for (bytes, peer) in packets {
+            let tcp = shared.tcp_receiver.lock().unwrap().clone();
+            let ws = shared.ws_receiver.lock().unwrap().clone();
+            let mut sent = 0usize;
+            for (bytes, peer) in packets {
+                if crate::transport::tcp::is_virtual_peer(peer) {
+                    if let Some(tcp) = &tcp {
+                        tcp.try_send(&bytes, peer).await;
+                        sent += 1;
+                    } else {
+                        shared.stats.dropped_down.incr();
+                        tracing::debug!(%peer, "TCP 传输未启用,丢弃下行");
+                    }
+                } else if crate::transport::ws::is_virtual_peer(peer) {
+                    if let Some(ws) = &ws {
+                        ws.try_send(&bytes, peer).await;
+                        sent += 1;
+                    } else {
+                        shared.stats.dropped_down.incr();
+                        tracing::debug!(%peer, "WS 传输未启用,丢弃下行");
+                    }
+                } else if let Some(sender) = &sender {
                     if let Err(e) = sender.send(&bytes, peer).await {
                         shared.stats.dropped_down.incr();
                         tracing::debug!(%peer, error = %e, "UDP 下行发送失败");

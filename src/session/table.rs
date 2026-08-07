@@ -517,15 +517,20 @@ impl SessionTable {
 
         session.last_rx = now;
 
-        // 1. 处理对端 ack:清重传队列 + RTT 采样。
+        // 1. 处理对端 ack:清重传队列 + RTT 采样 + KCP 快速重传。
         let mut rtt_ms = None;
         for qi in 0..2 {
-            let (acked, sample) = session.retrans[qi].on_ack(header.ack, header.ack_bits, now);
+            let (acked, sample, fast) = session.retrans[qi].on_ack(header.ack, header.ack_bits, now);
             if !acked.is_empty() {
                 self.stats.acks_seen.incr_by(acked.len() as u64);
             }
             if sample.is_some() {
                 rtt_ms = sample;
+            }
+            // KCP 模式:空洞被连续跳过 >= 2 次 → 不等 RTO 立即重发。
+            for bytes in fast {
+                send_back(&bytes, peer);
+                self.stats.retransmits.incr();
             }
         }
         if let Some(ms) = rtt_ms {
@@ -737,6 +742,23 @@ fn handle_ch2(
 
     // ── 出站 ──
 
+    /// 引擎关闭时的 drain:把所有会话移除并生成 Close 事件
+    ///(PlayFab 模式:先广播 SessionClose 再退出,给逻辑服收尾窗口)。
+    pub fn shutdown_all(&self) -> Vec<SessionEvent> {
+        let mut events = Vec::new();
+        for shard in &self.shards {
+            let mut guard = shard.lock().unwrap();
+            for (_, s) in guard.drain() {
+                self.stats.sessions_active.decr();
+                events.push(SessionEvent::Close {
+                    sess_id: s.sess_id,
+                    reason: CLOSE_GRACE_TIMEOUT, // 引擎关闭即断开
+                });
+            }
+        }
+        events
+    }
+
     /// 查询会话(engine 处理逻辑服的 Send/Multicast/Kick/SetBudget 用)。
     pub fn lookup(&self, sess_id: u64) -> Option<Session> {
         self.shards
@@ -746,8 +768,7 @@ fn handle_ch2(
     }
 
     /// 踢掉一个会话(逻辑服 Kick 或鉴权失败)。
-    pub fn kick(&self, sess_id: u64, _reason: u8) -> Option<Session> {
-        for shard in &self.shards {
+    pub fn kick(&self, sess_id: u64, _reason: u8) -> Option<Session> {        for shard in &self.shards {
             let mut guard = shard.lock().unwrap();
             let conn_id = guard
                 .iter()

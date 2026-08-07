@@ -23,6 +23,8 @@ hmac = "0.12"
 sha2 = "0.10"
 # tracing:结构化日志,惰性求值,热路径零开销。
 tracing = "0.1"
+tokio-tungstenite = "0.30.0"
+futures-util = "0.3.33"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
