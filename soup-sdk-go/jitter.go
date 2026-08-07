@@ -44,7 +44,7 @@ func seqNewer(a, b InputSeq) bool {
 // 去重:seq 已交付或已在缓冲中 → 拒绝。
 func (st *pstate) insertJitter(e jitterEntry) bool {
 	// 去重(回绕安全):不新于已交付最大 seq 的丢弃。
-	if st.lastSeq != 0 && !seqNewer(e.seq, st.lastSeq) {
+	if st.hasInput && !seqNewer(e.seq, st.lastSeq) {
 		if e.raw != nil {
 			st.srv.readPool.Put(e.raw)
 		}
@@ -106,14 +106,14 @@ func (r *room) deliverReadyInputs() {
 				break
 			}
 			// 只有 seq 连续才交付(空洞等待重传补帧;ch1 语义:留下续接)。
-			if st.lastSeq != 0 && head.seq != st.lastSeq+1 {
+			if st.hasInput && head.seq != st.lastSeq+1 {
 				break
 			}
 			pend = append(pend, pendingDeliver{player: p, clientTick: head.clientTick, seq: head.seq, payload: head.payload})
-			// 副本留作"缓冲为空时重复上一帧"。
-			copy(st.lastPayload, head.payload)
-			st.lastPayloadLen = len(head.payload)
+			// 副本留作"缓冲为空时重复上一帧"(记实际拷贝长度,防截断越界)。
+			st.lastPayloadLen = copy(st.lastPayload, head.payload)
 			st.lastSeq = head.seq
+			st.hasInput = true
 			if head.raw != nil {
 				st.srv.readPool.Put(head.raw)
 			}

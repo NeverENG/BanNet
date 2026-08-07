@@ -89,11 +89,11 @@ func (r *room) drainInbox() {
 }
 
 // handleEvent 处理一条入站事件。
-// inData 事件的读缓冲(raw)在 OnInput 返回后归还读池。
+// ch=2/3 的 inData 事件:读缓冲(raw)在 OnInput 返回后归还读池。
+// ⚠️ ch=1 输入**不能**在这里归还:raw 的所有权随 jitterEntry 转移,
+// 由 deliverReadyInputs 在交付后归还 —— 提前归还会 double-put 且缓冲
+// 可能被池复用覆写,导致交付给 OnInput 的数据损坏。
 func (r *room) handleEvent(ev inEvent) {
-	if ev.raw != nil {
-		defer r.srv.readPool.Put(ev.raw)
-	}
 	switch ev.kind {
 	case inOpen:
 		if _, dup := r.players[ev.player]; dup {
@@ -138,6 +138,7 @@ func (r *room) handleEvent(ev inEvent) {
 		st.clearBaseline()
 		st.jbuf = st.jbuf[:0]
 		st.lastSeq = 0
+		st.hasInput = false
 		b := r.ctx.BeginSend(ev.player, ChReliableOrdered, MsgFullState)
 		r.impl.EncodeFullState(ev.player, b)
 		r.ctx.Commit(b)
@@ -153,7 +154,10 @@ func (r *room) handleEvent(ev inEvent) {
 		if _, ok := r.players[ev.player]; !ok {
 			return
 		}
-		// ch=2/3 业务事件:直接交付(读缓冲由 defer 归还)。
+		if ev.raw != nil {
+			defer r.srv.readPool.Put(ev.raw)
+		}
+		// ch=2/3 业务事件:直接交付(读缓冲由上面的 defer 归还)。
 		r.impl.OnInput(r.ctx, ev.player, InputSeq(ev.msg), ev.payload)
 
 	case inStats:
@@ -162,7 +166,10 @@ func (r *room) handleEvent(ev inEvent) {
 			st.loss = ev.loss
 		}
 	case inOverload:
-		r.overload = true // 快照全局降频(见 baseline.go settleDegrade)
+		// 全局降频(见 baseline.go settleDegrade)。
+		// 保守策略:收到一次 Overload 即保持降频直到房间结束 —— 框架在持续
+		// 拥塞时应周期性重发,停止发送即表示恢复(自动恢复未实现,避免抖动)。
+		r.overload = true
 	}
 }
 
@@ -222,7 +229,8 @@ func (r *room) stop() {
 		r.srv.metrics.PlayersOnline.Add(-1)
 	}
 	r.flushOutbox()
-	r.replay.Close() // 关闭回放录制
+	r.replay.Finish(uint32(r.tick)) // 回放录制:回写总 tick 数
+	r.replay.Close()                // 关闭回放录制
 }
 
 // mapLeaveReason 把框架 SessionClose 的 reason 映射为 SDK 的 LeaveReason。// 1 = 宽限期超时(CLOSE_GRACE_TIMEOUT),2 = 被踢(CLOSE_KICKED)。

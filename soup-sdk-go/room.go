@@ -269,7 +269,8 @@ type pstate struct {
 	rtt  uint16
 	loss uint16
 
-	lastSeq InputSeq // 已交付最大输入序号(去重基准)
+	lastSeq  InputSeq // 已交付最大输入序号(去重基准)
+	hasInput bool     // 是否交付过输入(lastSeq 的哨兵,0 不再是"未初始化")
 
 	// 抖动缓冲(M04)。
 	jbuf           []jitterEntry

@@ -81,8 +81,13 @@ func (g *pong) StateHash() uint64 {
 	return h.Sum64()
 }
 
-// pongNew 是 pong 的建房工厂(seed 不用,物理确定性)。
-func pongNew(seed uint64) Room { return &pong{} }
+// pongNew 是 pong 的建房工厂:球带初速,确保 Tick 有状态演化
+// (否则重放缺 Tick 推进也测不出 —— review 踩坑)。
+func pongNew(seed uint64) Room {
+	g := &pong{}
+	g.vel = [2]int32{6, 4}
+	return g
+}
 
 // newTestRoom 构造一个测试房间(带一个已加入的玩家)。
 func newTestRoom(t *testing.T, impl Room) *room {
@@ -152,7 +157,7 @@ func TestReplayDeterminism(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	room := &pong{}
+	room := pongNew(42)
 	inputs := []struct {
 		tick uint32
 		pl   uint32
@@ -176,6 +181,7 @@ func TestReplayDeterminism(t *testing.T) {
 		room.Tick(nil, Tick(t), 50)
 	}
 	wantHash := room.StateHash()
+	rec.Finish(30) // 录制跑了 30 个 tick
 	rec.Close()
 
 	// 重放:重建房间,离线跑完,比对 hash。

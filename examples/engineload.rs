@@ -62,7 +62,11 @@ async fn handshake(client: &UdpSocket, engine_addr: std::net::SocketAddr) -> (u3
         .unwrap()
         .unwrap();
     let (_, frames) = decode(&rbuf[..n]).unwrap();
-    let challenge = frames.first().unwrap().body.to_vec();
+    // 收到纯 ACK/心跳等无帧包时重收(不能 unwrap —— 压测中引擎可能先发心跳)。
+    let challenge = match frames.first() {
+        Some(f) => f.body.to_vec(),
+        None => return Box::pin(handshake(client, engine_addr)).await,
+    };
     let mut body = Vec::with_capacity(8 + token.len());
     body.extend_from_slice(&challenge);
     body.extend_from_slice(token);
@@ -223,6 +227,16 @@ async fn client_worker(
         buf.extend_from_slice(&mac);
         sock.send_to(&buf, engine_addr).await.unwrap();
         pending.lock().unwrap().insert(seq, Instant::now());
+        // 防 seq 回绕后 pending 无限膨胀:超过 512 条清最旧。
+        if pending.lock().unwrap().len() > 512 {
+            let oldest = *pending
+                .lock()
+                .unwrap()
+                .keys()
+                .min()
+                .unwrap();
+            pending.lock().unwrap().remove(&oldest);
+        }
         sent += 1;
         seq = seq.wrapping_add(1);
         tokio::time::sleep(interval).await;
