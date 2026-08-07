@@ -184,7 +184,7 @@ func Replay(path string, newRoom func(seed uint64) Room) (uint64, uint64, error)
 			idx++
 		}
 		lastHash = impl.StateHash()
-		impl.Tick(ctx, Tick(t), 50)
+		impl.Tick(ctx, Tick(t), uint32(1000/tickHz)) // dtMS 与录制 tickHz 一致
 		lastHash = impl.StateHash()
 	}
 	return lastHash, uint64(len(recs)), nil
