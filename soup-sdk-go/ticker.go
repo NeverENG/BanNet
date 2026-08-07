@@ -61,9 +61,11 @@ func (r *room) advance(step time.Duration, timer *time.Timer) {
 	}
 }
 
-// doTick 执行一个 tick:drainInbox → 交付输入 → room.Tick → 快照调度 → flush。
+// doTick 执行一个 tick:drainInbox → 交付输入(抖动缓冲+全序)→ room.Tick →
+// 快照调度 → flush。
 func (r *room) doTick() {
 	r.drainInbox()
+	r.deliverReadyInputs()
 	out := r.impl.Tick(r.ctx, r.tick, r.dtMS)
 	if out == End {
 		r.stopReq = true
@@ -74,7 +76,7 @@ func (r *room) doTick() {
 }
 
 // drainInbox 非阻塞地消化全部积压事件(帧 → 事件处理)。
-// 输入(ch=1 的 Data)按到达顺序直接交付 OnInput(抖动缓冲属于 S3)。
+// ch=1 输入进抖动缓冲(S3),ch=2/3 直接交付。
 func (r *room) drainInbox() {
 	for {
 		select {
@@ -97,7 +99,17 @@ func (r *room) handleEvent(ev inEvent) {
 		if _, dup := r.players[ev.player]; dup {
 			return
 		}
-		st := &pstate{sess: ev.sess}
+		st := &pstate{
+			srv:  r.srv,
+			sess: ev.sess,
+			// S3:抖动缓冲与基线环容量、上一帧副本缓冲(预分配,零分配)。
+			jcap:         r.srv.cfg.JitterBufferTicks*4 + 4,
+			jbuf:         make([]jitterEntry, 0, r.srv.cfg.JitterBufferTicks*4+4),
+			jdepth:       r.srv.cfg.JitterBufferTicks,
+			lastPayload:  make([]byte, 2048),
+			baselineCap:  r.srv.cfg.BaselineRingSize,
+			baselineRing: make([]Tick, 0, r.srv.cfg.BaselineRingSize),
+		}
 		r.players[ev.player] = st
 		r.sessOf[ev.sess] = ev.player
 		r.srv.metrics.PlayersOnline.Add(1)
@@ -121,7 +133,11 @@ func (r *room) handleEvent(ev inEvent) {
 		if _, ok := r.players[ev.player]; !ok {
 			return
 		}
-		// 先推全量,再通知房间(不触发 OnLeave)
+		st := r.players[ev.player]
+		// 重连(M05F04):清基线环与抖动缓冲 → 推全量 → OnResume(不触发 OnLeave)。
+		st.clearBaseline()
+		st.jbuf = st.jbuf[:0]
+		st.lastSeq = 0
 		b := r.ctx.BeginSend(ev.player, ChReliableOrdered, MsgFullState)
 		r.impl.EncodeFullState(ev.player, b)
 		r.ctx.Commit(b)
@@ -129,11 +145,15 @@ func (r *room) handleEvent(ev inEvent) {
 		r.impl.OnResume(r.ctx, ev.player, ev.gapMS)
 
 	case inData:
-		st, ok := r.players[ev.player]
-		if !ok {
+		if ev.ch == ChInput {
+			// 输入:进抖动缓冲,由 deliverReadyInputs 按 (clientTick, player) 全序交付。
+			r.handleCh1Input(ev)
 			return
 		}
-		st.lastSeq = InputSeq(ev.msg)
+		if _, ok := r.players[ev.player]; !ok {
+			return
+		}
+		// ch=2/3 业务事件:直接交付(读缓冲由 defer 归还)。
 		r.impl.OnInput(r.ctx, ev.player, InputSeq(ev.msg), ev.payload)
 
 	case inStats:
@@ -141,28 +161,32 @@ func (r *room) handleEvent(ev inEvent) {
 			st.rtt = ev.rtt
 			st.loss = ev.loss
 		}
+	case inOverload:
+		r.overload = true // 快照全局降频(见 baseline.go settleDegrade)
 	}
 }
 
-// scheduleSnapshots 按 SnapshotHz 为每个玩家调度一次快照。
-// 当前里程碑基线恒为 {Valid:false}(全量);S3 引入基线环形缓冲后
-// 此处改为按客户端回传的 lastRecvSnapshotTick 选择基线。
-func (r *room) scheduleSnapshots() {
-	every := r.snapshotEvery()
-	if every <= 0 || uint32(r.tick)%uint32(every) != 0 {
-		return
-	}
-	for p := range r.players {
-		b := r.ctx.BeginSend(p, ChUnreliable, MsgSnapshot)
-		r.impl.EncodeSnapshot(p, Baseline{Valid: false}, b)
-		r.ctx.Commit(b)
+// setOverload 由框架 Overload 帧触发(跨 goroutine,经 channel 投递,
+// 房间 goroutine 消费后生效)。
+func (r *room) setOverload(on bool) {
+	select {
+	case r.inbox <- inEvent{kind: inOverload}:
+	default:
 	}
 }
 
-// snapshotEvery 返回每多少个 tick 调度一次快照(TickHz/SnapshotHz,向上取整)。
+// recordReplay 录制一条输入交付(S4 回放用)。
+func (r *room) recordReplay(d pendingDeliver) {
+	if r.replay != nil {
+		r.replay.Record(uint32(r.tick), uint32(d.player), uint16(d.seq), d.payload)
+		r.srv.metrics.ReplayWritten.Add(1)
+	}
+}
+
+// snapshotEvery 返回每多少个 tick 调度一次快照(基于动态快照频率)。
 func (r *room) snapshotEvery() int {
 	hz := r.srv.cfg.TickHz
-	shz := r.srv.cfg.SnapshotHz
+	shz := r.snapshotHz()
 	if shz <= 0 || hz <= 0 {
 		return 1
 	}
@@ -198,10 +222,10 @@ func (r *room) stop() {
 		r.srv.metrics.PlayersOnline.Add(-1)
 	}
 	r.flushOutbox()
+	r.replay.Close() // 关闭回放录制
 }
 
-// mapLeaveReason 把框架 SessionClose 的 reason 映射为 SDK 的 LeaveReason。
-// 1 = 宽限期超时(CLOSE_GRACE_TIMEOUT),2 = 被踢(CLOSE_KICKED)。
+// mapLeaveReason 把框架 SessionClose 的 reason 映射为 SDK 的 LeaveReason。// 1 = 宽限期超时(CLOSE_GRACE_TIMEOUT),2 = 被踢(CLOSE_KICKED)。
 func mapLeaveReason(reason uint8) LeaveReason {
 	switch reason {
 	case 1:

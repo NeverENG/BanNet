@@ -10,7 +10,11 @@ type Metrics struct {
 	TickSkipped   atomic.Int64 // 因落后超过 3 tick 被丢弃的 tick 数
 	InboxDrops    atomic.Int64 // 房间入站队列溢出丢弃的事件数
 	OutDrops      atomic.Int64 // 出站帧丢弃数(UDS 掉线或出站队列满)
-	InputStarved  atomic.Int64 // 输入饥饿计数(S3 抖动缓冲启用后生效)
+	InputStarved  atomic.Int64 // 输入饥饿计数(抖动缓冲为空,重复上一帧)
+	SnapshotsSent atomic.Int64 // 快照发送数
+	SnapshotsFull atomic.Int64 // 全量快照数(关键帧/无基线)
+	Degraded      atomic.Int64 // 快照降频次数
+	ReplayWritten atomic.Int64 // 回放录制输入条数
 }
 
 // MetricsSnapshot 是 Metrics 的一致性快照(纯值,无原子操作)。
@@ -21,6 +25,10 @@ type MetricsSnapshot struct {
 	InboxDrops    int64
 	OutDrops      int64
 	InputStarved  int64
+	SnapshotsSent int64
+	SnapshotsFull int64
+	Degraded      int64
+	ReplayWritten int64
 }
 
 // Snapshot 返回当前计数的一致性快照。
@@ -32,5 +40,9 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		InboxDrops:    m.InboxDrops.Load(),
 		OutDrops:      m.OutDrops.Load(),
 		InputStarved:  m.InputStarved.Load(),
+		SnapshotsSent: m.SnapshotsSent.Load(),
+		SnapshotsFull: m.SnapshotsFull.Load(),
+		Degraded:      m.Degraded.Load(),
+		ReplayWritten: m.ReplayWritten.Load(),
 	}
 }
