@@ -1,54 +1,48 @@
-//! # BanNet
+//! # soup-engine
 //!
-//! 一个极致轻量的异步 TCP 框架(学习项目),灵感来自 ZINX。
-//! 本质:1 个 Server 管理 N 个 Connection,按 msgID 把消息路由给业务 handler。
+//! 与具体游戏无关的实时对战服务器框架(Rust)。
+//! Go 逻辑服通过 soup-sdk-go 调用它,只写游戏规则,不碰任何网络细节
+//! (规格书 `docs/T0002SoupEngine.md`)。
 //!
-//! ## 目标产品形态(北极星)
-//! ```ignore
-//! use bannet::Server;
-//!
-//! #[tokio::main]
-//! async fn main() -> bannet::Result<()> {
-//!     let mut server = Server::builder("127.0.0.1:8999")
-//!         .workers(8)
-//!         .max_conns(10_000)
-//!         .build()?;
-//!
-//!     server.on(1, |req| async move {
-//!         req.reply(b"pong").await   // 回包,msgID 自动沿用
-//!     });
-//!
-//!     server.run().await
-//! }
-//! ```
+//! 它吃掉「做一个能扛住移动网络的实时对战服务器」里**所有与游戏内容无关
+//! 的部分**:UDP 传输、可靠层、通道语义、会话、断线重连、NAT 漂移、组播、
+//! 背压、限流、抗攻击、可观测性。换一个游戏,这一整套原样复用。
 //!
 //! ## 分层架构
-//! - [`protocol`]  协议层:消息本体 + TLV 编解码(不碰网络)
-//! - [`transport`] 传输层:连接读/写流水线 + 连接管理
-//! - [`routing`]   路由层:Request 上下文 + Router 分发
-//! - [`server`]    门面层:把上面三层组装起来,对用户暴露
+//! - [`protocol`]  协议层:UDP 数据报 / UDS 帧的编解码(纯函数,不碰网络)
+//! - [`session`]   会话层:会话表、握手、生命周期、NAT 漂移
+//! - [`transport`] 传输层:UDP 多 socket(SO_REUSEPORT)、UDS 帧流
+//! - [`buffer`]    缓冲池:分级复用,热路径零堆分配
+//! - [`stats`]     原子指标
+//! - [`engine`]    门面层:装配一切,对用户暴露
+//!
+//! ## 使用
+//! ```ignore
+//! use soup_engine::{Engine, EngineConfig};
+//!
+//! #[tokio::main]
+//! async fn main() -> soup_engine::Result<()> {
+//!     let engine = Engine::new(EngineConfig {
+//!         bind_addr: "0.0.0.0:8999".parse().unwrap(),
+//!         uds_path: "/run/soup-engine.sock".into(),
+//!         ..EngineConfig::default()
+//!     });
+//!     engine.run().await
+//! }
+//! ```
 
-// ── 子系统(层)声明 ──
-// 每个 `mod` 对应 src/ 下的一个目录(protocol/ transport/ routing/),
-// 目录里的 mod.rs 是该层入口。server 是单文件模块。
-mod client;
-mod error;
-mod protocol;
-mod routing;
-mod server;
-mod transport;
-// ── crate 根公开 API(重导出)──
-// 逐阶段打开。阶段 0:先把 Server 摆上货架,用户 `use bannet::Server;` 即可。
-pub use server::Server;
+mod engine;
 
-// 通用客户端 API。
-pub use client::Client;
-// 请求上下文和路由类型。
-pub use routing::Router;
-pub use transport::Request;
-// 目前导出协议类型,方便 examples/客户端直接构造 TLV 消息。
-pub use protocol::DataPack;
-pub use protocol::Message;
+pub mod buffer;
+pub mod error;
+pub mod protocol;
+pub mod reliable;
+pub mod session;
+pub mod stats;
+pub mod transport;
 
-// TODO(后续阶段逐步打开):
-// pub use transport::Connection;
+pub use buffer::BufferPool;
+pub use engine::{Engine, EngineConfig};
+pub use error::{Error, Result};
+pub use session::SessionTable;
+pub use stats::Stats;

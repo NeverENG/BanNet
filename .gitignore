@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+
+# 工具元数据与缓存
+.reasonix/
+soup-sdk-go/.gocache/

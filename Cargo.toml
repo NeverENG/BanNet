@@ -1,18 +1,32 @@
 [package]
-name = "bannet"
+name = "soup-engine"
 version = "0.1.0"
 edition = "2021"
-description = "一个极致轻量的异步 TCP 框架 —— 学习 Rust + 网络编程"
+description = "soup-engine —— 与具体游戏无关的实时对战服务器框架(Rust)。UDP 可靠传输 + UDS 对接 Go 逻辑服。"
 
-# 这是一个 library crate:BanNet 框架本体。
-# 库根是 src/lib.rs。用户通过 `use bannet::...` 使用它。
+# library crate:soup-engine 框架本体,库根 src/lib.rs。
 [lib]
-name = "bannet"
+name = "soup_engine"
 path = "src/lib.rs"
 
 [dependencies]
-# tokio:异步运行时。先用 full 特性,等结构稳定再裁剪成极致轻量。
+# tokio:异步运行时。先用 full,等结构稳定再裁剪成极致轻量。
 tokio = { version = "1", features = ["full"] }
+# bytes:缓冲与分帧的基础。
+bytes = "1"
+# socket2:SO_REUSEPORT 等多 socket 预绑定。
+socket2 = { version = "0.5", features = ["all"] }
+# rand:握手随机源、seed 生成。
+rand = "0.8"
+# hmac + sha2:握手 challenge 校验与包 HMAC(防伪造)。
+hmac = "0.12"
+sha2 = "0.10"
+# tracing:结构化日志,惰性求值,热路径零开销。
+tracing = "0.1"
 
 [dev-dependencies]
-# dev-dependencies 只在编译 examples/tests/benches 时用到,不会进入库的依赖。
+tracing-subscriber = "0.3"
+
+[[example]]
+name = "engineload"
+path = "examples/engineload.rs"

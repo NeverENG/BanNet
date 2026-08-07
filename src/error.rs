@@ -1,27 +1,39 @@
 //! 框架统一错误类型。
 //!
-//! 之前代码里借用了 `std::fmt::Error` 当错误类型 —— 那是给 `Display` 用的,
-//! 它没有任何 variant,承载不了信息。这里定义 BanNet 自己的 `Error`,
-//! 并给出 `bannet::Result<T>` 别名(lib 文档里承诺过的那个)。
+//! 延续 BanNet 的单一 `Error` 枚举风格,扩展出协议解析 / 会话等变体。
+//! 所有解析路径都返回 `Err` 而不是 panic —— 畸形包必须走错误分支
+//! (见规格书 T0002M07:任何输入都不得 panic)。
 
 use std::fmt;
 
 #[derive(Debug)]
 pub enum Error {
-    /// 底层 IO 错误(read / write / bind / accept)。
+    /// 底层 IO 错误(read / write / bind / connect)。
     Io(std::io::Error),
-    /// 回包失败:写半边的 task 已经退出,mpsc 通道关闭了。
+    /// 通道发送失败:对端 task 已退出。
     Send(String),
+    /// 协议解析错误:畸形包 / 非法字段。带说明,不 panic。
+    Protocol(String),
+    /// 会话不存在(已经关闭或从未建立)。
+    SessionNotFound(u64),
+    /// 通道已关闭。
+    Closed(String),
+    /// 配置错误。
+    Config(String),
 }
 
-/// 全框架统一的 Result。用户 handler 也返回它。
+/// 全框架统一的 Result。
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(e) => write!(f, "IO 错误: {e}"),
-            Error::Send(msg) => write!(f, "回包失败: {msg}"),
+            Error::Send(msg) => write!(f, "发送失败: {msg}"),
+            Error::Protocol(msg) => write!(f, "协议错误: {msg}"),
+            Error::SessionNotFound(id) => write!(f, "会话不存在: sess_id={id}"),
+            Error::Closed(msg) => write!(f, "通道已关闭: {msg}"),
+            Error::Config(msg) => write!(f, "配置错误: {msg}"),
         }
     }
 }
@@ -30,7 +42,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(e) => Some(e),
-            Error::Send(_) => None,
+            _ => None,
         }
     }
 }
