@@ -40,12 +40,27 @@ pub struct SessionTableConfig {
     pub shards: usize,
     /// 握手超时(默认 3s)。
     pub handshake_timeout: Duration,
-    /// 活跃会话无包进入宽限期的时长(默认 5s)。
+    /// 活跃会话无包进入宽限期的时长(默认 5s;dynamic_timeouts 时作下限)。
     pub idle_grace: Duration,
-    /// 宽限期长度,超过即 SessionClose(默认 20s)。
+    /// 宽限期长度,超过即 SessionClose(默认 20s;dynamic_timeouts 时作下限)。
     pub reconnect_grace: Duration,
     /// 是否启用每包 HMAC(默认 true;与 v1 明文客户端联调时可关)。
     pub enable_hmac: bool,
+    /// 断线/回收超时是否随会话 RTT 自适应(默认 true)。
+    ///
+    /// 调研(ENet `clamp(limit×2×RTT, min, max)` / QUIC idle timeout):
+    /// 低延迟环境应快速判定断线并回收会话(资源友好),高延迟环境放宽防误杀。
+    /// 启用时:idle = clamp(30×SRTT, timeout_min, timeout_max);
+    /// reconnect = clamp(120×SRTT, reconnect_min, reconnect_max)。
+    pub dynamic_timeouts: bool,
+    /// 动态 idle 下限(默认 1.5s)。
+    pub timeout_min: Duration,
+    /// 动态 idle 上限(默认 5s)。
+    pub timeout_max: Duration,
+    /// 动态 reconnect 下限(默认 5s)。
+    pub reconnect_min: Duration,
+    /// 动态 reconnect 上限(默认 20s)。
+    pub reconnect_max: Duration,
 }
 
 impl Default for SessionTableConfig {
@@ -56,6 +71,11 @@ impl Default for SessionTableConfig {
             idle_grace: IDLE_GRACE,
             reconnect_grace: RECONNECT_GRACE,
             enable_hmac: true,
+            dynamic_timeouts: true,
+            timeout_min: TIMEOUT_MIN,
+            timeout_max: TIMEOUT_MAX,
+            reconnect_min: RECONNECT_MIN,
+            reconnect_max: RECONNECT_MAX,
         }
     }
 }
@@ -634,9 +654,34 @@ fn handle_ch2(
 
     // ── 维护 ──
 
+    /// 活跃会话的实际断线判定窗口(RTT 自适应,ENet/QUIC 调研)。
+    /// dynamic_timeouts 关闭时退化为固定 `idle_grace`。
+    pub fn idle_grace_for(&self, s: &Session) -> Duration {
+        if !self.cfg.dynamic_timeouts {
+            return self.cfg.idle_grace;
+        }
+        let srtt = Duration::from_millis(s.rtt.srtt_ms() as u64);
+        if srtt.is_zero() {
+            return self.cfg.timeout_max; // 未采样:保守取上限
+        }
+        (srtt.saturating_mul(30)).clamp(self.cfg.timeout_min, self.cfg.timeout_max)
+    }
+
+    /// 宽限期的实际回收窗口(RTT 自适应)。
+    pub fn reconnect_grace_for(&self, s: &Session) -> Duration {
+        if !self.cfg.dynamic_timeouts {
+            return self.cfg.reconnect_grace;
+        }
+        let srtt = Duration::from_millis(s.rtt.srtt_ms() as u64);
+        if srtt.is_zero() {
+            return self.cfg.reconnect_max;
+        }
+        (srtt.saturating_mul(120)).clamp(self.cfg.reconnect_min, self.cfg.reconnect_max)
+    }
+
     /// 周期性维护(engine 的 maintenance task 调用):
-    /// - 活跃超 `idle_grace` → 进宽限期
-    /// - 宽限期超 `reconnect_grace` → 关闭并发 SessionClose
+    /// - 活跃超 `idle_grace_for` → 进宽限期
+    /// - 宽限期超 `reconnect_grace_for` → 关闭并发 SessionClose
     pub fn maintain(&self, now: Instant) -> Vec<SessionEvent> {
         let mut events = Vec::new();
         for shard in &self.shards {
@@ -645,14 +690,14 @@ fn handle_ch2(
             for (conn_id, s) in guard.iter_mut() {
                 match s.state {
                     SessionState::Active => {
-                        if now.duration_since(s.last_rx) >= self.cfg.idle_grace {
+                        if now.duration_since(s.last_rx) >= self.idle_grace_for(s) {
                             s.state = SessionState::Grace { since: now };
                             self.stats.sessions_grace.incr();
                             tracing::debug!(conn_id = s.conn_id, "进入重连宽限期");
                         }
                     }
                     SessionState::Grace { since } => {
-                        if now.duration_since(since) >= self.cfg.reconnect_grace {
+                        if now.duration_since(since) >= self.reconnect_grace_for(s) {
                             to_close.push(*conn_id);
                         }
                     }
@@ -921,5 +966,85 @@ trait SessionMapExt {
 impl SessionMapExt for HashMap<u32, Session> {
     fn get_by_sess_id(&self, sess_id: u64) -> Option<&Session> {
         self.values().find(|s| s.sess_id == sess_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_with_rtt(ms: u16) -> Session {
+        let mut s = Session {
+            conn_id: 1,
+            sess_id: 1,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            secret: 0,
+            token: Vec::new(),
+            send_seq: 0,
+            last_rx: Instant::now(),
+            state: SessionState::Active,
+            budget_kbps: None,
+            established: Instant::now(),
+            recv_seq: 0,
+            recv_bits: 0,
+            ch1_last: None,
+            ch3_seen: VecDeque::new(),
+            retrans: [RetransmitQueue::new(), RetransmitQueue::new()],
+            rtt: RttEstimator::new(),
+            assembler: FragmentAssembler::new(),
+            frag_group_id: 0,
+            bytes_window: VecDeque::new(),
+            reorder: BTreeMap::new(),
+            delivered_seqs: VecDeque::new(),
+            delivered_max: 0,
+            ch2_next: None,
+        };
+        for _ in 0..5 {
+            s.rtt.update(ms as f64);
+        }
+        s
+    }
+
+    #[test]
+    fn adaptive_idle_grace_by_rtt() {
+        let table = SessionTable::new(SessionTableConfig::default());
+        // 低延迟(1ms):clamp(30ms, 1.5s, 5s) = 1.5s —— 快速判定断线。
+        let low = table.idle_grace_for(&session_with_rtt(1));
+        assert_eq!(low, Duration::from_millis(1500), "低延迟应取 idle 下限");
+        // 中延迟(100ms):clamp(3s, 1.5s, 5s) = 3s。
+        let mid = table.idle_grace_for(&session_with_rtt(100));
+        assert_eq!(mid, Duration::from_secs(3));
+        // 高延迟(500ms):clamp(15s, 1.5s, 5s) = 5s —— 放宽防误杀。
+        let high = table.idle_grace_for(&session_with_rtt(500));
+        assert_eq!(high, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn adaptive_reconnect_grace_by_rtt() {
+        let table = SessionTable::new(SessionTableConfig::default());
+        // 低延迟:clamp(120ms, 5s, 20s) = 5s。
+        assert_eq!(table.reconnect_grace_for(&session_with_rtt(1)), Duration::from_secs(5));
+        // 中延迟(100ms):clamp(12s, 5s, 20s) = 12s。
+        assert_eq!(table.reconnect_grace_for(&session_with_rtt(100)), Duration::from_secs(12));
+        // 高延迟(500ms):clamp(60s, 5s, 20s) = 20s。
+        assert_eq!(table.reconnect_grace_for(&session_with_rtt(500)), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn adaptive_falls_back_to_fixed() {
+        let mut cfg = SessionTableConfig::default();
+        cfg.dynamic_timeouts = false;
+        let table = SessionTable::new(cfg);
+        let s = session_with_rtt(1);
+        assert_eq!(table.idle_grace_for(&s), IDLE_GRACE);
+        assert_eq!(table.reconnect_grace_for(&s), RECONNECT_GRACE);
+    }
+
+    #[test]
+    fn unsampled_rtt_uses_conservative_max() {
+        let table = SessionTable::new(SessionTableConfig::default());
+        let s = session_with_rtt(0); // srtt 未采样(update(0) 被忽略)
+        assert_eq!(table.idle_grace_for(&s), Duration::from_secs(5));
+        assert_eq!(table.reconnect_grace_for(&s), Duration::from_secs(20));
     }
 }

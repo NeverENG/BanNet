@@ -38,7 +38,10 @@ use crate::transport::udp::{UdpReceiver, UdpSender};
 use crate::transport::uds::{UdsConnection, UdsReader, UdsWriter};
 
 /// 逻辑服掉线后的重连间隔。
+/// 逻辑服重连:指数退避(yojimbo connecting_after_disconnect 调研),
+/// 1s → 2s → 4s → 8s 封顶,连接成功即重置,防逻辑服重启风暴。
 const LOGIC_RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+const LOGIC_RECONNECT_MAX: Duration = Duration::from_secs(8);
 /// Overload 通知的最小间隔(节流,避免刷屏)。
 const OVERLOAD_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -120,6 +123,11 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// 逻辑服是否在线(供监控/工具轮询)。
+    pub fn logic_online(&self) -> bool {
+        self.shared.logic_online.load(Ordering::Relaxed)
+    }
+
     pub fn new(cfg: EngineConfig) -> Self {
         let sessions = SessionTable::new(cfg.session.clone());
         Self {
@@ -282,9 +290,12 @@ fn notify_overload(shared: &Arc<Shared>) {
 // ── 逻辑服连接循环(支持热重启,规格书 T0002M04F06)──
 
 async fn logic_link_loop(cfg: &EngineConfig, shared: &Arc<Shared>) {
+    // 指数退避:每次失败翻倍,成功重置为初始值(防重启风暴,调研 yojimbo)。
+    let mut backoff = LOGIC_RECONNECT_INTERVAL;
     loop {
         match UdsConnection::connect(&cfg.uds_path).await {
             Ok(mut conn) => {
+                backoff = LOGIC_RECONNECT_INTERVAL; // 连接成功:重置退避
                 shared.logic_online.store(true, Ordering::Relaxed);
                 shared.stats.logic_reconnects.incr();
                 tracing::info!(path = %cfg.uds_path.display(), "逻辑服已连接");
@@ -300,7 +311,8 @@ async fn logic_link_loop(cfg: &EngineConfig, shared: &Arc<Shared>) {
                         tracing::warn!(error = %e, "EngineHello 发送失败");
                         *shared.up_tx.write().unwrap() = None;
                         shared.logic_online.store(false, Ordering::Relaxed);
-                        tokio::time::sleep(LOGIC_RECONNECT_INTERVAL).await;
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(LOGIC_RECONNECT_MAX);
                         continue;
                     }
                 }
@@ -337,7 +349,8 @@ async fn logic_link_loop(cfg: &EngineConfig, shared: &Arc<Shared>) {
                 tracing::debug!(path = %cfg.uds_path.display(), error = %e, "逻辑服未就绪,重试");
             }
         }
-        tokio::time::sleep(LOGIC_RECONNECT_INTERVAL).await;
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(LOGIC_RECONNECT_MAX);
     }
 }
 
@@ -462,12 +475,14 @@ async fn maintenance_loop(shared: &Arc<Shared>, sender: &UdpSender) {
                 shared.sessions.maintain_reliable(now, &mut |bytes, peer| {
                     let _ = sender2.try_send(bytes, peer);
                 });
-                // 心跳:对活跃会话每 1s 发空数据报(规格书 T0002M03F03)。
+                // 心跳(QUIC §10.1.1 PING 探测调研):只对「最近无流量」的活跃
+                // 会话发空数据报(保 NAT 映射 + 探活);流量正常的会话不发,
+                // 省去固定 1Hz 心跳的空包开销。
                 let last_hb = *shared.last_heartbeat.lock().unwrap();
                 if now.duration_since(last_hb) >= HEARTBEAT_INTERVAL {
                     *shared.last_heartbeat.lock().unwrap() = now;
                     shared.sessions.for_each_session(|s| {
-                        if s.is_active() {
+                        if s.is_active() && now.duration_since(s.last_rx) >= HEARTBEAT_INTERVAL {
                             let (ack, ack_bits) = s.compute_ack();
                             let mut out = Vec::with_capacity(16);
                             let header = DatagramHeader {

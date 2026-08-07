@@ -60,6 +60,19 @@ pub const RECONNECT_GRACE: Duration = Duration::from_secs(20);
 /// 心跳间隔 1Hz。
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
+// ── RTT 自适应超时(调研:ENet `clamp(limit×2×RTT, min, max)` / QUIC idle)──
+// 低延迟环境快速判定断线并回收会话(资源友好),高延迟放宽防误杀。
+// 公式:idle = clamp(30×SRTT, TIMEOUT_MIN, TIMEOUT_MAX);
+//       reconnect = clamp(120×SRTT, RECONNECT_MIN, RECONNECT_MAX)。
+/// idle 下限:低延迟下最快 1.5s 判定断线。
+pub const TIMEOUT_MIN: Duration = Duration::from_millis(1500);
+/// idle 上限:高延迟下最多容忍 5s 无包。
+pub const TIMEOUT_MAX: Duration = Duration::from_secs(5);
+/// reconnect 下限:低延迟下宽限期最短 5s(超过即 SessionClose)。
+pub const RECONNECT_MIN: Duration = Duration::from_secs(5);
+/// reconnect 上限:高延迟下宽限期最长 20s。
+pub const RECONNECT_MAX: Duration = Duration::from_secs(20);
+
 // ── 可靠层(T0002M03F03) ──
 
 /// 单通道重传队列上限,溢出即断连。

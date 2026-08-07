@@ -146,6 +146,11 @@ async fn lifecycle_reconnect_nat_hotrestart() {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         uds_path: uds_path.clone(),
         udp_workers: 2,
+        session: soup_engine::session::table::SessionTableConfig {
+            // 本测试验证状态机语义(5s 进宽限/20s 关闭),用固定窗口。
+            dynamic_timeouts: false,
+            ..Default::default()
+        },
         ..EngineConfig::default()
     };
     let engine = Arc::new(Engine::new(cfg));
