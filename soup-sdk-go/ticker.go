@@ -209,6 +209,8 @@ func (r *room) flushOutbox() {
 	s := r.srv
 	for _, b := range r.outFrames {
 		n := b.off + b.len
+		if len(b.data) >= 14 {
+		}
 		select {
 		case s.outbox <- outFrame{data: b.data[:n], buf: b}:
 		default:

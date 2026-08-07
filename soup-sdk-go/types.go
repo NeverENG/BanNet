@@ -77,6 +77,8 @@ const (
 	LeaveKicked
 	// LeaveQuit 表示主动退出或房间结束。
 	LeaveQuit
+	// LeaveDisconnect 表示引擎连接断开(会话随引擎进程消失)。
+	LeaveDisconnect
 )
 
 // RoomID 是房间的唯一标识,由 Gatekeeper 决定。

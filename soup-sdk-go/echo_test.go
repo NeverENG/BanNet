@@ -54,6 +54,21 @@ type echoTestConn struct {
 	buf  []byte
 }
 
+// dialEngine 等 SDK 的 UDS 监听就绪后拨号连接(引擎侧扮演)。
+func dialEngine(t *testing.T, path string) net.Conn {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.Dial("unix", path)
+		if err == nil {
+			return conn
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("3s 内未连上 SDK 监听 %s", path)
+	return nil
+}
+
 func (c *echoTestConn) write(t *testing.T, typ byte, body []byte) {
 	t.Helper()
 	if err := WriteFrame(c.conn, typ, body); err != nil {
@@ -83,12 +98,6 @@ func TestEchoThroughSDK(t *testing.T) {
 		path = filepath.Join(os.TempDir(), "soup-echo.sock")
 	}
 	_ = os.Remove(path)
-	ln, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(path)
-	defer ln.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -101,11 +110,8 @@ func TestEchoThroughSDK(t *testing.T) {
 	})
 	go func() { _ = srv.Run(ctx) }()
 
-	// 引擎侧 accept SDK 的连接。
-	conn, err := ln.Accept()
-	if err != nil {
-		t.Fatal(err)
-	}
+	// SDK 是 UDS 监听端;引擎侧 dial 过去(架构:引擎主动连逻辑服)。
+	conn := dialEngine(t, path)
 	defer conn.Close()
 	ec := &echoTestConn{conn: conn, buf: make([]byte, 64*1024)}
 
@@ -157,12 +163,6 @@ func TestSplitSessionOpen(t *testing.T) {
 		path = filepath.Join(os.TempDir(), "soup-split.sock")
 	}
 	_ = os.Remove(path)
-	ln, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(path)
-	defer ln.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -173,10 +173,7 @@ func TestSplitSessionOpen(t *testing.T) {
 	})
 	go func() { _ = srv.Run(ctx) }()
 
-	conn, err := ln.Accept()
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn := dialEngine(t, path)
 	defer conn.Close()
 	ec := &echoTestConn{conn: conn, buf: make([]byte, 64*1024)}
 

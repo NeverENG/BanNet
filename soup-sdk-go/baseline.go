@@ -105,6 +105,9 @@ func (r *room) settleDegrade() {
 
 // snapshotHz 返回当前实际快照频率(受降级影响)。
 func (r *room) snapshotHz() int {
+	if r.srv.cfg.SnapshotHz <= 0 {
+		return 0 // 禁用快照
+	}
 	hz := r.srv.cfg.SnapshotHz
 	if r.overload {
 		hz /= 2

@@ -823,8 +823,7 @@ fn handle_ch2(
                 if !s.is_active() {
                     return Err(Error::SessionNotFound(sess_id));
                 }
-                let now = Instant::now();
-                let mut out = Vec::new();
+                let now = Instant::now();                let mut out = Vec::new();
                 let (ack, ack_bits) = s.compute_ack();
 
                 let mk_header = |seq: u16| DatagramHeader {

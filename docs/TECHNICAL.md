@@ -193,3 +193,39 @@ socket 的包全部堆积在它的接收缓冲里丢失(实测 ACK 100% 丢)。
 | 20 客户端 × 200pps × 5s | 2832 msg/s | 1.0 / 2.1 ms | 0 | 0 |
 
 重跑:`cargo run --release --example engineload -- --clients N --pps M --duration T`
+
+---
+
+## 8. 跨语言联调:真实 Rust 引擎 ⇄ Go SDK 逻辑服
+
+**工具**:`examples/interop.rs`(引擎只做网络 + 客户端)+ `soup-sdk-go/cmd/echologic`(Go 逻辑服,echo 房间)。
+
+```bash
+cd soup-sdk-go && go run ./cmd/echologic --socket /tmp/soup-interop.sock
+cargo run --release --example interop -- --uds /tmp/soup-interop.sock --count 5
+# ✓ 引擎已连上 Go 逻辑服 → 握手 → 5 条 ping 经 Go 逻辑服 echo 往返成功
+```
+
+联调暴露并修复的 3 个真实缺陷(纯单元/单侧测试发现不了):
+
+### 踩坑 8:Go SDK 是拨号端,与架构(引擎主动重连)矛盾
+
+**症状**:引擎 connect、SDK 也 Dial —— 没有监听端,谁也连不上谁。
+**根因**:T0002M04F06 要求引擎热重启后主动重连逻辑服,逻辑服必须是 **UDS 监听端**;
+但 `engineConn` 实现成了客户端。
+**修复**:`conn.go` 改为 bind+listen+accept(逻辑服为服务端,引擎按退避重连过来);
+`echo_test` 的模拟引擎改为 dial。
+
+### 踩坑 9:引擎进程死亡,Go SDK 会话表残留
+
+**症状**:引擎(kill/崩溃)后新引擎的 SessionOpen(同 sess_id)被 SDK 当「重复」忽略,
+玩家永不加入。
+**根因**:引擎进程死亡不会发 SessionClose,SDK `sessions` 表残留旧会话。
+**修复**:`engineConn` 增加 `onDead` 回调 —— 连接断开时 SDK 清理全部会话
+并通知房间 OnLeave(`LeaveDisconnect`),引擎重启后新会话正常加入。
+
+### 踩坑 10:SnapshotHz=0 被兜底成每 tick 快照
+
+**症状**:想关快照做对照实验,反而每 tick 发快照(10Hz → 20Hz)。
+**根因**:`snapshotHz()` 的 `if hz < 1 { hz = 1 }` 把 0 兜底成 1。
+**修复**:`SnapshotHz <= 0` 直接返回 0(禁用),不再兜底。

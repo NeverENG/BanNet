@@ -377,6 +377,8 @@ async fn logic_read_loop(reader: &mut UdsReader, shared: &Arc<Shared>) -> Result
         let Some(frame) = reader.read_frame().await? else {
             return Ok(()); // 对端关闭
         };
+        if frame.ty == FRAME_SEND && !frame.body.is_empty() {
+        }
         handle_logic_frame(&frame, shared).await?;
     }
 }
@@ -442,10 +444,13 @@ async fn send_outbound(shared: &Arc<Shared>, sess_id: u64, ch: u8, msg_id: u16, 
             // 先 clone 出发送端再 await,避免 MutexGuard 跨 await 持有。
             let sender = shared.udp_sender.lock().unwrap().clone();
             if let Some(sender) = sender {
+                let mut sent = 0usize;
                 for (bytes, peer) in packets {
                     if let Err(e) = sender.send(&bytes, peer).await {
                         shared.stats.dropped_down.incr();
                         tracing::debug!(%peer, error = %e, "UDP 下行发送失败");
+                    } else {
+                        sent += 1;
                     }
                 }
             }

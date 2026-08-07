@@ -97,7 +97,6 @@ func NewServer(cfg Config) *Server {
 	}
 	s := &Server{
 		cfg:           cfg,
-		conn:          newEngineConn(cfg.EngineSocket, defaultReconnectBase),
 		rooms:         make(map[RoomID]*room),
 		sessions:      make(map[uint64]*sessionRef),
 		outbox:        make(chan outFrame, defaultOutboxCap),
@@ -105,6 +104,8 @@ func NewServer(cfg Config) *Server {
 		inboxCap:      defaultInboxCap,
 		reconnectBase: defaultReconnectBase,
 	}
+	s.conn = newEngineConn(cfg.EngineSocket, defaultReconnectBase)
+	s.conn.onDead = s.onEngineDead
 	s.readPool.New = func() any { return make([]byte, s.maxFrameLen) }
 	s.bufPool.New = func() any { return &Buffer{data: make([]byte, poolBufferCap)} }
 	return s
@@ -112,6 +113,29 @@ func NewServer(cfg Config) *Server {
 
 // Run 启动服务并阻塞,直到 ctx 被取消(正常退出,返回 nil)。
 //
+
+// onEngineDead 在引擎连接断开时被调用:引擎进程死亡意味着所有客户端
+// 会话不复存在 —— 清理会话表,并通知各房间玩家离开(引擎重启后新会话
+// 会重新 SessionOpen/OnJoin)。
+func (s *Server) onEngineDead() {
+	s.roomsMu.Lock()
+	defer s.roomsMu.Unlock()
+	n := 0
+	for sess, ref := range s.sessions {
+		if r, ok := s.rooms[ref.roomID]; ok {
+			select {
+			case r.inbox <- inEvent{kind: inClose, sess: sess, reason: uint8(LeaveDisconnect)}:
+			default:
+			}
+		}
+		delete(s.sessions, sess)
+		n++
+	}
+	if n > 0 {
+		log.Printf("soup: 引擎连接断开,清理 %d 个会话", n)
+	}
+}
+
 // 启动后立即进入重连循环:框架未就绪时按指数退避持续拨号。
 func (s *Server) Run(ctx context.Context) error {
 	if s.cfg.Gatekeeper == nil {
@@ -175,7 +199,7 @@ func (s *Server) writeLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case f := <-s.outbox:
-			if _, err := conn.Write(f.data); err != nil {
+			if _, werr := conn.Write(f.data); werr != nil {
 				s.metrics.OutDrops.Add(1)
 				s.conn.markDead(conn)
 			}
